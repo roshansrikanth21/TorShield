@@ -1,0 +1,21 @@
+# kernel build artifacts
+*.ko
+*.o
+*.mod
+*.mod.c
+*.symvers
+*.order
+.tmp_versions/
+.*.cmd
+Module.symvers
+modules.order
+*.dwo
+
+# userspace tools
+torshieldctl
+xorctl
+
+# editor / os noise
+*.swp
+*~
+.DS_Store
