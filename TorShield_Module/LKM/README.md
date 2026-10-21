@@ -1,5 +1,10 @@
 # TorShield (kernel module, v2)
 
+> **Frozen snapshot.** This tree is kept for the paper/handoff. The current
+> module is [`module/LKM`](../../module/LKM) at the repository root. This copy
+> predates the v4 AEAD tunnel and hybrid TUN datapaths, so its usage and
+> limitations sections are out of date.
+
 Bidirectional kernel-level traffic obfuscation for Linux, built on Netfilter.
 This is a corrected rewrite of the original `xor_obfuscation` module. It is a
 research/teaching artifact, **not** a replacement for real encryption

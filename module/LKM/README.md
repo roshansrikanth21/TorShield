@@ -1,23 +1,34 @@
-# TorShield (kernel module, v2)
+# TorShield kernel module (v4)
 
-Bidirectional kernel-level traffic obfuscation for Linux, built on Netfilter.
+Authenticated, encrypted point-to-point tunnel for Linux, implemented as a
+kernel module. Canonical source: `torshield.c` in this directory.
+
 This is a corrected rewrite of the original `xor_obfuscation` module. It is a
-research/teaching artifact, **not** a replacement for real encryption
-(WireGuard, TLS, IPsec).
+research/teaching artifact, **not** a replacement for WireGuard, IPsec or TLS.
 
-## What changed from the original
+## Modes
 
-| Problem in the original | Fix in v2 |
-|---|---|
-| Only hooked `POST_ROUTING` (egress) — the receiver never decrypted, so two hosts could not actually talk | Hooks both `POST_ROUTING` (encrypt) and `PRE_ROUTING` (decrypt) |
-| IPv4 only | IPv4 **and** IPv6 |
-| XOR'd *all* TCP/UDP traffic — broke DNS, TLS, loopback, one-sided/gateway use | Only touches traffic to/from an explicit **peer allowlist**; inert until peers are set |
-| Set `CHECKSUM_NONE` but never recomputed the checksum — most NICs send bad checksums, receiver drops them | Recomputes the full transport checksum in software; leaves hardware-offload (`CHECKSUM_PARTIAL`) packets to the NIC |
-| Each host rotated the key independently (`key = (key+17) % 256`), so the two ends desynced | A static 256-bit pre-shared key plus a **per-packet nonce** derived from header fields both ends see; no coordination needed |
-| `printk` on **every packet**, logging src/dst IPs — wrecks throughput and leaks the metadata it claims to protect | No per-packet logging; key material never logged |
-| `/proc/xor_key` was mode `0666` (any user could read/set the key) | `/proc/torshield/*` are mode `0600` (root only); the key is never read back |
-| `del_timer` on unload (timer could fire after free) | No timers; the keystream is a pure function of (key, nonce) |
-| Single-byte XOR (256 possible keys) | **ChaCha20** (RFC 8439) via the kernel crypto library — a real, fast, length-preserving stream cipher (the one WireGuard uses) |
+`/proc/torshield/mode` selects the datapath (global, applies to every netns):
+
+| Value | Mode | Behaviour |
+|---|---|---|
+| `tunnel` | **default** | Netfilter `POST_ROUTING` encapsulates traffic to configured peers in UDP:4789; `LOCAL_IN` (after IP reassembly) authenticates and re-injects |
+| `hybrid` | opt-in | `torshield0` netdevice (`rtnl_link_ops` kind `torshield`) encapsulates traffic routed into it; netfilter still handles all other peer traffic |
+| `stream` | legacy | Length-preserving payload transform, retained for comparison; **no integrity/authentication** |
+
+## Crypto and framing
+
+- **ChaCha20-Poly1305** (RFC 7539), synchronous, using the in-kernel ChaCha20
+  helper plus a Poly1305 implementation, because `gcm(aes)` is async and cannot
+  be used from softirq context.
+- Wire format: `outer IP | UDP:4789 | 16-byte header | padded ciphertext | 16-byte tag`.
+  The header is the AAD; the nonce is a 4-byte XOR fold of the outer addresses
+  followed by the 64-bit big-endian sequence number.
+- Plaintext is zero-padded to 64-byte buckets; the inner header determines the
+  real length after decryption.
+- Replay window: 64 packets per peer, advanced only after successful
+  authentication.
+- Outer IPv4 packets get a per-packet IP ID so fragmented datagrams are safe.
 
 ## Build
 
@@ -28,19 +39,18 @@ sudo apt-get install -y build-essential linux-headers-$(uname -r)
 make                       # builds torshield.ko and torshieldctl
 ```
 
-Verified to compile cleanly (`make W=1`, `gcc -Wall -Wextra`) against Linux 6.8.
+Verified clean (`make W=1`) on 6.8.0-147 and 6.17.0-42.
 
 ## Usage
 
 On **both** hosts, with the same pre-shared key:
 
 ```bash
-sudo insmod torshield.ko
-# 64 hex chars = 256-bit ChaCha20 key (same on both hosts)
+sudo modprobe torshield
 sudo ./torshieldctl set-key 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
-sudo ./torshieldctl add-peer 10.0.0.2                          # the other host
+sudo ./torshieldctl add-peer 10.0.0.2
 sudo ./torshieldctl list-peers
-sudo ./torshieldctl status                                     # "set" / "unset"
+sudo ./torshieldctl status                    # set / unset
 ```
 
 The module stays inert until a PSK **and** at least one peer are configured, so
@@ -51,32 +61,38 @@ sudo ./torshieldctl clear-peers
 sudo rmmod torshield
 ```
 
-`/proc/torshield/psk` · `peers` are the raw interfaces; `torshieldctl` is a
-thin wrapper over them.
+### Hybrid device
+
+```bash
+echo hybrid | sudo tee /proc/torshield/mode
+sudo ip link add name torshield0 link eth0 type torshield
+sudo ip link set torshield0 up
+sudo ip route add 10.0.0.2/32 dev torshield0
+```
+
+`link DEV` selects the underlay interface; the outer route lookup is pinned to
+it so the route to the inner peer cannot recurse back into the device. The
+device MTU is 1360 (`min 576`, `max 1360`), giving a TCP MSS of 1320.
 
 ## Known limitations
 
-- **Nonce derivation, not negotiation.** ChaCha20 needs a unique nonce per
-  packet. Since the packet length can't grow to carry one, the nonce is
-  derived from header fields both ends see: addresses, ports, and the TCP
-  sequence number (for UDP, the IP ID + length, which is weaker). A TCP
-  retransmission reuses the nonce but carries the same plaintext, which is
-  safe; the residual risks are TCP sequence-number wrap (>4 GB on one
-  connection) and the narrow UDP nonce space. A production design would
-  negotiate a per-packet nonce or key id out of band.
-- **No integrity or authentication.** This is encryption of the payload only,
-  not an AEAD tunnel. It defeats signature-based DPI and passive inspection,
-  not flow-feature ML classifiers, entropy analysis, or an adversary who can
-  tamper with packets.
-- **Packet headers are untouched**, so size, timing, and endpoints remain
-  visible.
-- **GSO packets and IPv6 extension headers are passed through unmodified** (not
-  obfuscated) to avoid corrupting them.
-- Config (`/proc/torshield`) is **global module state** shared across network
-  namespaces; the hooks themselves run in every namespace.
+- One static 256-bit PSK; no handshake, no forward secrecy, no rekeying.
+- DoS: any source can make the receiver perform a Poly1305 check (no cookie or
+  rate limit before authentication).
+- The peer list, key and mode are global module state shared across namespaces.
+- No PMTU discovery or ICMP relay; TCP MSS is clamped, large UDP relies on
+  outer fragmentation/reassembly (verified to 60 KB). The receiver linearizes a
+  reassembled skb before the AEAD, so a very large datagram needs a high-order
+  atomic allocation and is dropped if it fails.
+- Hybrid uses **inner == outer** addressing in the prototype; distinct tunnel
+  addresses need an endpoint mapping and policy routing.
+- Stream mode (legacy) has no integrity and is not the default.
 
 ## Files
 
 - `torshield.c` — the kernel module
 - `torshieldctl.c` — userspace control tool
 - `Makefile` — builds both
+
+Project-level results and the evidence log: [`../../README.md`](../../README.md),
+[`../../TO-DO.md`](../../TO-DO.md), [`../../TUN-HYBRID.md`](../../TUN-HYBRID.md).
