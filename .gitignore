@@ -13,6 +13,7 @@ modules.order
 
 # userspace tools
 torshieldctl
+torshield-tc
 xorctl
 
 # test captures (binary evidence, reproduced by the stage scripts)

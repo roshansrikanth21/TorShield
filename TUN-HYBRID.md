@@ -1,10 +1,13 @@
 # Hybrid networking: a TUN-style netdevice for tunnel mode (option B)
 
-**Status:** prototype implemented and runtime-verified on 6.8.0-147 (QEMU).
+**Status:** route-based hybrid and TC (`tc` mode) prototypes implemented and runtime-verified
+on 6.8.0-147 (QEMU).
 **Build:** clean on 6.8.0-147 and 6.17.0-42.
 **Code:** `module/LKM/torshield.c` — `ts_ndo_start_xmit`, `ts_dev_setup`,
-`ts_newlink`, `ts_link_ops`, `TS_MODE_HYBRID`.
-**Test:** `.work/vm-src/stage18.sh`.
+`ts_newlink`, `ts_link_ops`, `TS_MODE_HYBRID`, `TS_MODE_TC`;
+`module/LKM/tc/` — eBPF classifier and libbpf loader.
+**Tests:** `.work/vm-src/stage18.sh` (routes), `.work/vm-src/stage21.sh` (TC),
+`.work/vm-src/stage20.sh` (cryptokey routing).
 
 ---
 
@@ -95,19 +98,21 @@ transparent path. Consequently:
 Ingress is unchanged in both modes: the UDP decap at `NF_INET_LOCAL_IN` authenticates,
 checks the replay window, decrypts and re-injects the inner packet.
 
-### 2.4 Address model (prototype limitation)
+### 2.4 Address model (implemented: cryptokey routing)
 
-The prototype uses **inner == outer** addresses: the outer header copies the inner source
-and destination, exactly like the netfilter path. That is sufficient to prove the datapath,
-but a general route-based deployment needs:
+The first prototype used **inner == outer** addresses. Cryptokey routing now gives each peer
 
-* a distinct **tunnel address** per endpoint (the outer address),
-* a **peer endpoint mapping** (inner prefix → outer endpoint), and
-* policy routing so that the inner prefix is routed into `torshield0` while the underlay
-  prefix stays on the physical link.
+* a 32-byte key and a deterministic 32-bit key id,
+* a list of allowed **inner** prefixes,
+* an **outer endpoint**,
 
-Those are configuration-plane changes; the wire format already carries everything needed
-(family bit + 64-bit sequence + AEAD over the header).
+with longest-prefix-match egress on the inner destination, an ingress ACL on the inner source,
+and endpoint roaming after authenticated traffic (R36). The TC test proves the separation with
+underlay `10.0.1.x`/`fd01::x` and inner `10.0.0.x`/`fd00::x` (R39), so inner prefixes can
+overlap the underlay.
+
+The peer table, key material and mode are still **global module state**, shared by every
+network namespace.
 
 ---
 
@@ -142,20 +147,64 @@ instead of being counted as malformed drops (`dev_drop` went from 3–5 per run 
   route MTU before `ndo_start_xmit`. This is simple and correct but gives up GSO batching;
   the netfilter path still uses GSO. Adding `NETIF_F_GSO` would require segmenting inside
   the driver.
-* **Same-address model** (see 2.4). Not yet suitable for overlapping inner prefixes.
-* **One underlay per device.** Multipath/ECMP and endpoint roaming are not implemented.
+* **One underlay per device.** Multipath/ECMP is not implemented; endpoint roaming is (R36).
 * **No PMTU discovery / ICMP relay.** The MTU is static at 1360 and TCP adapts via MSS.
 * **Peer list and key are global** (shared by all netns), as in tunnel mode.
 * **No rekeying, no handshake, no DoS cookie** — unchanged from tunnel mode.
-* **Global mode switch.** `hybrid` affects every namespace; per-netns modes would need
+* **Global mode switch.** `hybrid`/`tc` affects every namespace; per-netns modes would need
   per-netns state.
 
 ---
 
-## 5. Next steps
+## 5. TC clsact/eBPF egress (`tc` mode)
 
-1. Split inner/outer addressing: endpoint mapping plus policy routing, so `torshield0` can
-   carry prefixes that overlap the underlay.
+`tc` mode keeps the same device and wire format but replaces route-based steering with a
+classifier on the underlay's egress:
+
+* `module/LKM/tc/torshield_tc.c` — a `sched_cls` program with LPM tries `allowed4`/`allowed6`
+  (the peer inner prefixes) and `cfg[0]` = the torshield device ifindex. A match is
+  `bpf_redirect`ed to the device; outer frames carry `TS_TC_MARK` so they are not redirected
+  again. Multicast/link-local destinations and link-local sources are skipped.
+* `module/LKM/tc/torshield_tc_load.c` — `torshield-tc attach|detach` (libbpf). It loads the
+  object, fills the maps from `-4`/`-6` prefixes, attaches to the underlay's clsact egress,
+  and only then writes `tc` to `/proc/torshield/mode`. `detach` writes `tunnel` first and
+  then removes the qdisc, so traffic falls back to the netfilter path.
+* `ts_ndo_start_xmit` strips the L2 header a TC redirect carries
+  (`skb_network_header - skb->data`, 1..32 bytes). IPv4 arrives with a 14-byte Ethernet
+  header; IPv6 arrives already at L3 in this kernel.
+
+**Why the AEAD is not in BPF.** The tunnel needs the synchronous ChaCha20/Poly1305 path;
+BPF helpers cannot call it. TC only classifies and redirects; the device encapsulates.
+
+**Fail-open caveat.** Netfilter `POST_ROUTING` runs **before** TC egress. In `tc` mode the
+netfilter egress hook is bypassed (otherwise packets would be encapsulated twice), so if the
+classifier disappears — qdisc deleted, program unloaded, wrong netns — peer traffic leaves in
+the clear. The helper orders attach → mode and mode → detach, but a supervisor is required in
+a real deployment. This is inherent to steering at TC rather than at netfilter.
+
+Verified with `stage21.sh` (R37–R40), distinct inner/outer addresses:
+
+| Check | Result |
+|---|---|
+| IPv4 UDP echo, 256 × 1 KB | **256/256 (262144 bytes)** |
+| IPv6 UDP echo, 64 × 1 KB | **64/64 (65536 bytes), retries 0** |
+| Path counters | `dev_out 647`, `tun_out 0`, `tun_in 647`, `tun_acl 0`, `dev_drop 0`, `tun_drop 0` |
+| Host AEAD, v4 capture | **210/210** with per-peer `K`; **0/210** with the global PSK |
+| Host AEAD, v6 capture | **68/68** with `K6`; **0/68** with the global PSK |
+| Addresses | outer `10.0.1.1→10.0.1.2` / `fd01::1→fd01::2`; inner `10.0.0.1→10.0.0.2` / `fd00::1→fd00::2` |
+| Detach | mode returns to `tunnel`; netfilter echo **16/16**, `tun_out +32`, `dev_out` unchanged |
+
+Bring-up defect: the first v6 TC run redirected IPv6 NDP for the underlay because the test
+used the same address for inner and outer; some solicitations also had link-local sources,
+which the peer ACL correctly rejected (`tun_acl 27–28`). Fixed by separating inner/outer
+addresses and by skipping multicast and link-local sources in the classifier (`tun_acl 0`).
+
+---
+
+## 6. Next steps
+
+1. Make TC egress fail closed (a supervisor that removes `tc` mode when the classifier is
+   gone, or a pre-TC drop design).
 2. Advertise GSO/TSO and segment in the driver, then re-measure throughput.
 3. Deliver decapped packets through the tunnel netdevice (`skb->dev = torshield0`) so that
    `rp_filter`, policy routing and per-device counters apply to ingress as well.

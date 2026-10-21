@@ -8,6 +8,7 @@ Re-implements only the framing/nonce rules and delegates the crypto to
 cross-check of the in-kernel AEAD, not a round-trip.
 """
 import struct
+import socket
 import sys
 
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
@@ -131,16 +132,24 @@ def main():
             print("packet %d: AUTH FAILED (%s) seq=%d ct=%d" % (n, e, seq, len(ct)))
             continue
         ok += 1
-        if n <= 5 or (len(inner) > 20 and inner[9] == 6):
+        if n <= 5 or (len(inner) > 20 and inner[0] >> 4 == 4 and inner[9] == 6):
             m = tcp_mss(inner)
             if m is not None:
                 mss_seen.append(m)
             if n <= 5:
-                print("packet %d: kid=%u seq=%d ct=%d inner=%d ver=%d proto=%d %s -> %s mss=%s"
-                      % (n, key_id, seq, len(ct), len(inner), inner[0] >> 4,
-                         inner[9],
-                         ".".join(map(str, inner[12:16])),
-                         ".".join(map(str, inner[16:20])), m))
+                iver = inner[0] >> 4
+                if iver == 6 and len(inner) >= 40:
+                    s = socket.inet_ntop(socket.AF_INET6, inner[8:24])
+                    d = socket.inet_ntop(socket.AF_INET6, inner[24:40])
+                    print("packet %d: kid=%u seq=%d ct=%d inner=%d ver=6 proto=%d %s -> %s"
+                          % (n, key_id, seq, len(ct), len(inner),
+                             inner[6], s, d))
+                else:
+                    print("packet %d: kid=%u seq=%d ct=%d inner=%d ver=%d proto=%d %s -> %s mss=%s"
+                          % (n, key_id, seq, len(ct), len(inner), iver,
+                             inner[9],
+                             ".".join(map(str, inner[12:16])),
+                             ".".join(map(str, inner[16:20])), m))
     print("tunnel_packets=%d authenticated=%d" % (n, ok))
     if mss_seen:
         print("inner_syn_mss=%s" % sorted(set(mss_seen)))

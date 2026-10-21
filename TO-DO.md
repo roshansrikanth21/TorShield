@@ -23,6 +23,8 @@ Claims are labelled `BUILD-VERIFIED`, `RUNTIME-VERIFIED`, or `STATIC-ONLY`.
 | Tunnel replay / tamper / non-peer | **DONE** — all dropped, counters exact |
 | Tunnel control plane | **DONE (procfs)** — mode, key, peers, stats |
 | Hybrid TUN networking | **DONE (prototype)** — `torshield0` netdevice, v4 + v6 verified |
+| Cryptokey routing | **DONE (prototype)** — per-peer keys, allowed prefixes, endpoint roaming |
+| TC clsact/eBPF egress (`tc` mode) | **DONE (prototype)** — LPM redirect to `torshield0`, v4 + v6 verified |
 | Docs (README + module README + CONTEXT) | **DONE** — rewritten to v4, false claims withdrawn |
 | CI, threat model, paper | **TODO** (P2/P3) |
 
@@ -167,9 +169,23 @@ atomic allocation and is dropped if that fails.
 - [x] Coexistence: netfilter skip for packets routed into a `torshield` device (`TS_MODE_HYBRID`)
 - [x] Interop test: netfilter-transparent peer ↔ TUN peer on the same wire format (R29/R30)
 - [ ] Receive path: deliver decapped packets through the tunnel netdevice (today: stack inject)
-- [ ] Decide inner-vs-outer address model (same address today; separate tunnel/underlay
-      addresses + endpoint mapping are needed for a general route-based deployment)
+- [x] Decide inner-vs-outer address model: distinct inner prefixes per peer with cryptokey
+      routing and endpoint roaming (R36); verified with 10.0.0.x/fd00::x inner and
+      10.0.1.x/fd01::x outer (R39)
 - [ ] Advertise GSO/TSO and segment in the driver (currently no offloads; stack segments to MTU)
+
+### P2.6 — TC clsact/eBPF egress (`tc` mode)
+- [x] eBPF classifier on the underlay's clsact egress: LPM tries of the peer inner prefixes,
+      redirect to the per-netns `torshield` device (R37/R38)
+- [x] libbpf loader/attacher (`torshield-tc`); attach first, then switch mode to `tc`;
+      detach switches back to `tunnel` before removing the qdisc (R40)
+- [x] Full L2 frame delivered by a TC redirect is stripped in `ndo_start_xmit`; AEAD stays in
+      the kernel device path, not in BPF (R37/R38)
+- [x] Independent AEAD verification of TC-path captures, per-peer keys vs global PSK (R39)
+- [ ] Fail-closed TC egress: POST_ROUTING runs before TC, so a missing/unloaded classifier
+      leaks peer traffic in the clear; needs a supervisor or a pre-TC drop design
+- [ ] Per-netns map lifecycle and pinned statistics (the loader currently owns the maps)
+- [ ] Offload/segmentation tuning for the TC path
 
 ### P3 — Operations, tests, docs
 - [ ] Netlink control plane (replace procfs), kill switch, safe mode, dry-run
@@ -227,6 +243,12 @@ Environment: Ubuntu 24.04 cloud image, kernel `6.8.0-147-generic`, QEMU 8.2 TCG 
 | R33 | Large inner UDP, 60000-byte datagram, tunnel mode | **60000/60000 correct (100%)**; `tun_out 2`, `tun_in 2`, `tun_drop 0`; outer split into 41 IP fragments, IDs distinct (3/41 fragments for the two datagrams) |
 | R34 | Reference AEAD on the defragmented 60000-byte capture (`defrag_verify.py`) | **AUTH OK**, inner 60032 bytes — proves the sender seals large payloads correctly and localised D2.5 to the receive path |
 | R35 | Hybrid regression on the final build (after D2.5/D2.6): stage18 | v4 **1048576/1048576 (100%)**, v6 **262144/262144 (100%)**; **807/807** v4 and **209/209** v6 frames authenticated by `verify_tunnel.py`; `dev_out 1021`, `dev_drop 0`, `tun_drop 0` |
+| R36 | Cryptokey routing (stage20): per-peer keys `K`/`K2`, per-peer allowed prefixes, distinct inner (10.0.0.x) and outer (10.0.0.99) addresses, ACL and roaming | v4 **256/256**, v6 **64/64**; host AEAD **246/246** with `K` and **0/246** with the global PSK; `K2` **1/1** and **0/1** with `K`; disallowed inner source dropped (`tun_acl 1`); endpoint moved to `10.0.0.88` and the next outer dst followed; tamper dropped |
+| R37 | TC egress (stage21), IPv4 UDP echo 256×1 KB | **256/256 correct (262144 bytes)**; `dev_out 512`, `tun_out 0`, `tun_in 512`, `tun_acl 0`, `tun_drop 0`, `dev_drop 0` — netfilter did not encapsulate, the device path did |
+| R38 | TC egress, IPv6 UDP echo 64×1 KB | **64/64 correct (65536 bytes), retries 0**; `dev_out 647`, `tun_out 0`, `tun_in 647`, `tun_acl 0`, `tun_drop 0`, `dev_drop 0` |
+| R39 | Independent AEAD on TC-path captures (`t21a` v4, `t21b` v6) | v4 **210/210** with `K`, **0/210** with the global PSK; v6 **68/68** with `K6`, **0/68** with the global PSK; outer `10.0.1.1→10.0.1.2` / `fd01::1→fd01::2`, inner `10.0.0.1→10.0.0.2` / `fd00::1→fd00::2` |
+| R40 | TC detach fallback | `torshield-tc detach` returns mode to `tunnel`; netfilter echo **16/16**, `tun_out +32`, `dev_out` unchanged |
+| R41 | Legacy regression on the final module (stages 16–20) + `W=1` build matrix | stage16 v4/v6 **100%** with exact replay/tamper counters; stage17 interop exact; stage18 hybrid **100%**, `dev_out 1021`, `dev_drop 0`; stage19 4000/60000-byte UDP **100%**; stage20 v4/v6 **256/256**, **64/64**; both 6.8.0-147 and 6.17.0-42 build clean with `W=1` |
 
 > R19/R20 are **not paper-grade**: TCG-emulated CPU. They show the direction and the overhead
 > source (per-byte software ChaCha20 + linearise), not real-hardware numbers.
@@ -249,7 +271,10 @@ WSL2 (no root) ── QEMU 8.2 TCG ── Ubuntu 24.04, 6.8.0-147-generic
 * Tunnel tests: `.work/vm-src/stage16.sh` (acceptance: build, load, TCP v4/v6, UDP,
   replay, tamper) and `.work/vm-src/stage17.sh` (replay/tamper/unknown-peer/interop).
   Hybrid device test: `.work/vm-src/stage18.sh` (device creation, v4 + v6 through
-  `ndo_start_xmit`, coexistence with the netfilter path).
+  `ndo_start_xmit`, coexistence with the netfilter path). Cryptokey routing:
+  `.work/vm-src/stage20.sh`. TC egress: `.work/vm-src/stage21.sh` (attach/detach, v4+v6
+  echo, path counters) and `.work/vm-src/tc6cap.sh`; `.work/vm-src/runlegacy2.sh` re-runs
+  stages 16–20 on a clean module.
   Independent checks: `verify_tunnel.py` (decrypts the capture with python-`cryptography`),
   `inject.py` (builds tunnel packets from scratch), `replay.py` (replays captured frames).
 
@@ -264,7 +289,7 @@ WSL2 (no root) ── QEMU 8.2 TCG ── Ubuntu 24.04, 6.8.0-147-generic
    check, so an off-path sender can force crypto work.
 3. **Peer = IP address only**, and one peer list is shared by every network namespace.
 4. **No PMTU discovery or ICMP relay.** Inner TCP is MSS-clamped; large inner UDP datagrams rely
-   on outer IP fragmentation and reassembly (not yet tested).
+   on outer IP fragmentation and reassembly, verified to 60 KB (R32/R33).
 5. **Outer UDP checksum is 0 over IPv4** (legal; integrity comes from the AEAD tag).
 6. **Throughput** measured only on emulated hardware (TCG).
 
@@ -283,24 +308,36 @@ WSL2 (no root) ── QEMU 8.2 TCG ── Ubuntu 24.04, 6.8.0-147-generic
 
 **Hybrid (TUN netdevice) prototype — see `TUN-HYBRID.md`:**
 
-13. **Same inner/outer addresses**; no endpoint mapping or policy routing yet, so overlapping
-    inner prefixes cannot be supported.
+13. Distinct inner/outer addressing is supported through cryptokey routing and endpoint roaming
+    (R36); the device path is still egress-only (ingress is the netfilter decap).
 14. **No offloads on the device** (no GSO/TSO); the stack segments to the 1360-byte MTU.
 15. Mode is **global**, not per-netns; ingress is still injected by the netfilter decap rather
     than delivered through the tunnel device (so `rp_filter`/policy routing do not see it).
+
+**TC (`tc` mode) prototype — see `TUN-HYBRID.md` §5:**
+
+16. **Fail-open if the classifier disappears.** `POST_ROUTING` runs before TC egress, so the
+    kernel cannot both let TC steer and fail closed. `torshield-tc` attaches before switching
+    to `tc` and reverts to `tunnel` before detaching, but an external `tc qdisc del` or an
+    unloaded program while mode is `tc` sends peer traffic in the clear. A supervisor is
+    required in any real deployment.
+17. Ingress is still the netfilter `LOCAL_IN` decap; only egress is classified by TC.
+18. BPF only classifies and redirects; the AEAD runs in `ndo_start_xmit` because the BPF helper
+    set cannot call the synchronous ChaCha20/Poly1305 path.
+19. One classifier instance is needed per network namespace (the `cfg` map holds a single
+    redirect ifindex), so both peers must run `torshield-tc attach`.
 
 ---
 
 ## I. Open questions for Roshan
 
-1. **"Shift the hooks to target the socket buffer"** — this is ambiguous: netfilter hooks already
-   receive an `sk_buff`. Did you mean (a) TC clsact/eBPF on `sk_buff`, (b) kprobes on
-   `tcp_sendmsg`/socket-level functions, (c) a netfilter hook that works on skb head/sg data
-   directly (which is what the tunnel now does), or (d) an explicit virtual netdevice?
-2. **Hybrid TUN** — interpretation confirmed and implemented: a kernel virtual L3 interface
-   (`torshield0`) steered by routes, reusing the UDP AEAD framing (`TUN-HYBRID.md`). Remaining
-   design question: keep inner == outer addresses (current prototype), or add distinct tunnel
-   addresses + an endpoint mapping for overlapping inner prefixes?
+1. ~~**"Shift the hooks to target the socket buffer"**~~ — **resolved:** TC clsact/eBPF on
+   `sk_buff` (`tc` mode, R37–R40), with the AEAD kept in the virtual netdevice's
+   `ndo_start_xmit` because BPF cannot call the synchronous crypto path.
+2. ~~**Hybrid TUN**~~ — **resolved and implemented:** a kernel virtual L3 interface
+   (`torshield0`) steered by routes, reusing the UDP AEAD framing (`TUN-HYBRID.md`), plus
+   distinct inner prefixes with cryptokey routing and endpoint roaming (R36). Route-based
+   hybrid and TC both use it; the inner/outer separation is verified in R39.
 3. **D3** — is the QEMU VM acceptable, or do you want `kalix0`/`meoww` (need login)?
 4. **D4** — paper: measurement-study framing confirmed? The 1266 Mbps figure must be withdrawn.
 5. **Authorship** — confirm the author line with the professor before publishing.

@@ -120,11 +120,15 @@ enum ts_mode {
 	TS_MODE_STREAM = 0,
 	TS_MODE_TUNNEL = 1,
 	TS_MODE_HYBRID = 2,     /* TUN netdevice egress + shared UDP decap */
+	TS_MODE_TC = 3,         /* egress steered by a TC clsact/eBPF classifier */
 };
 static int ts_mode = TS_MODE_TUNNEL;
 static unsigned int ts_port = 4789;
 module_param(ts_port, uint, 0644);
 MODULE_PARM_DESC(ts_port, "UDP port used by tunnel mode (default 4789)");
+static bool ts_debug;
+module_param(ts_debug, bool, 0644);
+MODULE_PARM_DESC(ts_debug, "log TC redirect header offsets (diagnostics)");
 
 static struct nf_hook_ops nfho_v4_out, nfho_v4_in, nfho_v4_local;
 static struct nf_hook_ops nfho_v6_out, nfho_v6_in, nfho_v6_local;
@@ -1708,6 +1712,13 @@ static unsigned int ts_tun_out(struct sk_buff *skb, bool v6)
 	struct ts_egress eg;
 	int err;
 
+	/* TC mode: a clsact/eBPF classifier redirects matching inner packets to
+	 * a torshield netdevice, whose ndo_start_xmit encapsulates them.  The
+	 * netfilter egress hook must stay out of the way or packets would be
+	 * encapsulated twice (once here, once by the device). */
+	if (READ_ONCE(ts_mode) == TS_MODE_TC)
+		return NF_ACCEPT;
+
 	if (skb->mark == TS_TUN_MARK)
 		return NF_ACCEPT;
 	if (ts_is_our_outer(skb, v6))
@@ -1833,6 +1844,26 @@ static netdev_tx_t ts_ndo_start_xmit(struct sk_buff *skb, struct net_device *dev
 	bool v6;
 	int err, reason = 0;
 
+	/* A TC clsact redirect hands us the full L2 frame from the underlay.
+	 * This device is ARPHRD_NONE and expects a network-layer skb, so drop
+	 * the link header the redirect carried over.  Packets routed straight
+	 * into the device already start at the IP header (hlen == 0). */
+	{
+		int hlen = (int)(skb_network_header(skb) - skb->data);
+
+		if (READ_ONCE(ts_debug))
+			pr_info("torshield: %s xmit len=%u data=%u neth=%u mach=%u maclen=%u proto=%04x b0=%02x hlen=%d\n",
+				dev->name, skb->len,
+				(unsigned int)(skb->data - skb->head),
+				skb->network_header, skb->mac_header,
+				skb->mac_len, ntohs(skb->protocol),
+				skb->len ? skb->data[0] : 0, hlen);
+		if (hlen > 0 && hlen <= 32) {
+			skb_pull(skb, hlen);
+			skb_reset_network_header(skb);
+		}
+	}
+
 	if (skb->len < sizeof(struct iphdr)) {
 		reason = 1;
 		goto drop;
@@ -1847,6 +1878,16 @@ static netdev_tx_t ts_ndo_start_xmit(struct sk_buff *skb, struct net_device *dev
 	default:
 		reason = 1;
 		goto drop;
+	}
+	if (READ_ONCE(ts_debug)) {
+		if (v6)
+			pr_info("torshield: %s inner v6 %pI6 -> %pI6 len=%u\n",
+				dev->name, &ipv6_hdr(skb)->saddr,
+				&ipv6_hdr(skb)->daddr, skb->len);
+		else
+			pr_info("torshield: %s inner v4 %pI4 -> %pI4 len=%u\n",
+				dev->name, &ip_hdr(skb)->saddr,
+				&ip_hdr(skb)->daddr, skb->len);
 	}
 	if (!priv->link || priv->link == dev->ifindex) {
 		reason = 2;
@@ -2333,8 +2374,9 @@ static const struct proc_ops peers_fops = {
 /* "tunnel" (default): UDP encapsulation with AEAD, padding and replay
  * protection, driven by netfilter.  "hybrid": the same wire format, but
  * egress is steered by routes into a "torshield" netdevice; ingress still
- * decapsulates at LOCAL_IN.  "stream": the original length-preserving
- * ChaCha20 transform. */
+ * decapsulates at LOCAL_IN.  "tc": the same device path, but egress is
+ * steered by a TC clsact/eBPF classifier instead of routes.  "stream": the
+ * original length-preserving ChaCha20 transform. */
 static int mode_show(struct seq_file *m, void *v)
 {
 	switch (READ_ONCE(ts_mode)) {
@@ -2343,6 +2385,9 @@ static int mode_show(struct seq_file *m, void *v)
 		break;
 	case TS_MODE_HYBRID:
 		seq_puts(m, "hybrid\n");
+		break;
+	case TS_MODE_TC:
+		seq_puts(m, "tc\n");
 		break;
 	default:
 		seq_puts(m, "stream\n");
@@ -2373,6 +2418,8 @@ static ssize_t mode_write(struct file *file, const char __user *ubuf,
 		WRITE_ONCE(ts_mode, TS_MODE_TUNNEL);
 	else if (strcmp(buf, "hybrid") == 0)
 		WRITE_ONCE(ts_mode, TS_MODE_HYBRID);
+	else if (strcmp(buf, "tc") == 0)
+		WRITE_ONCE(ts_mode, TS_MODE_TC);
 	else if (strcmp(buf, "stream") == 0)
 		WRITE_ONCE(ts_mode, TS_MODE_STREAM);
 	else
