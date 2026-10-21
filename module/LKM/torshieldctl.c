@@ -64,8 +64,8 @@ static void usage(const char *p)
 		"Usage:\n"
 		"  %s status\n"
 		"  %s set-key <hex>\n"
-		"  %s add-peer <ip>\n"
-		"  %s del-peer <ip>\n"
+		"  %s add-peer <endpoint> [key <64 hex>] [allowed <cidr[,cidr...]>]\n"
+		"  %s del-peer <endpoint>\n"
 		"  %s list-peers\n"
 		"  %s clear-peers\n",
 		p, p, p, p, p, p);
@@ -96,9 +96,18 @@ int main(int argc, char **argv)
 		return write_proc("psk", argv[2]) < 0 ? 1 : 0;
 
 	if (!strcmp(argv[1], "add-peer")) {
-		char v[64];
+		char v[1024];
+		size_t n;
+		int i;
 
-		snprintf(v, sizeof(v), "+%s", argv[2]);
+		n = (size_t)snprintf(v, sizeof(v), "+%s", argv[2]);
+		for (i = 3; i < argc; i++) {
+			int r = snprintf(v + n, sizeof(v) - n, " %s", argv[i]);
+
+			if (r < 0 || (size_t)r >= sizeof(v) - n)
+				return 1;
+			n += (size_t)r;
+		}
 		return write_proc("peers", v) < 0 ? 1 : 0;
 	}
 	if (!strcmp(argv[1], "del-peer")) {

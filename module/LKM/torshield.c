@@ -57,6 +57,7 @@
 #include <net/rtnetlink.h>
 #include <net/route.h>
 #include <net/ip6_route.h>
+#include <net/addrconf.h>
 #include <linux/netdevice.h>
 #include <linux/if_ether.h>
 
@@ -68,19 +69,50 @@ static u8   chacha_key[CHACHA_KEY_SIZE];      /* 256-bit pre-shared key     */
 static bool psk_set;                          /* false => module is inert   */
 static DEFINE_SPINLOCK(cfg_lock);             /* guards key/peers           */
 
-struct ts_peer {
-	struct list_head list;
-	u8               family;                  /* AF_INET / AF_INET6         */
+#define TS_MAX_PREFIXES 8
+
+struct ts_ep {
+	u8   family;                              /* AF_INET / AF_INET6         */
 	union {
 		__be32          v4;
 		struct in6_addr v6;
 	} addr;
+};
+
+struct ts_prefix {
+	u8   family;
+	u8   len;                                 /* prefix length in bits     */
+	union {
+		__be32          v4;
+		struct in6_addr v6;
+	} addr;
+};
+
+struct ts_peer {
+	struct list_head list;
+	u8               family;                  /* endpoint family            */
+	union {
+		__be32          v4;
+		struct in6_addr v6;
+	} addr;                                   /* endpoint address           */
+	u8               key[CHACHA_KEY_SIZE];    /* per-peer key (key_id != 0) */
+	u32              key_id;                  /* 0 = legacy global-PSK peer */
+	u8               n_prefixes;              /* allowed inner destinations */
+	struct ts_prefix prefix[TS_MAX_PREFIXES];
 	/* tunnel mode state */
 	atomic64_t       tx_seq;                  /* per-peer packet counter    */
 	u64              rx_last;                 /* replay window (under cfg)  */
 	u64              rx_bitmap;
 };
 static LIST_HEAD(peer_list);
+
+/* Snapshot of everything the egress path needs, taken under cfg_lock. */
+struct ts_egress {
+	u8         key[CHACHA_KEY_SIZE];
+	u32        key_id;
+	struct ts_ep ep;
+	u64        seq;
+};
 
 /* Stream = the original length-preserving transform.
  * Tunnel = encapsulate in UDP with AEAD, padding, sequence and replay window. */
@@ -223,6 +255,110 @@ static bool peer_match_locked(u8 family, const void *addr)
 	return peer_find_locked(family, addr) != NULL;
 }
 
+static struct ts_peer *peer_find_id_locked(u32 key_id)
+{
+	struct ts_peer *p;
+
+	if (!key_id)
+		return NULL;
+	list_for_each_entry(p, &peer_list, list)
+		if (p->key_id == key_id)
+			return p;
+	return NULL;
+}
+
+/* ---- cryptokey routing (allowed inner prefixes) ------------------------ */
+static bool ts_prefix_match(const struct ts_prefix *pf, u8 family,
+			    const void *addr)
+{
+	if (pf->family != family)
+		return false;
+
+	if (family == AF_INET) {
+		__be32 a = *(const __be32 *)addr;
+		__be32 m;
+
+		if (!pf->len)
+			return true;
+		m = htonl(~0U << (32 - pf->len));
+		return (a & m) == (pf->addr.v4 & m);
+	} else {
+		const struct in6_addr *a = (const struct in6_addr *)addr;
+		unsigned int full = pf->len / 8;
+		unsigned int rem = pf->len % 8;
+
+		if (memcmp(a->s6_addr, pf->addr.v6.s6_addr, full))
+			return false;
+		if (rem) {
+			u8 m = (u8)(0xff << (8 - rem));
+
+			if ((a->s6_addr[full] & m) !=
+			    (pf->addr.v6.s6_addr[full] & m))
+				return false;
+		}
+		return true;
+	}
+}
+
+static bool ts_peer_allows(const struct ts_peer *p, u8 family,
+			   const void *addr)
+{
+	int i;
+
+	for (i = 0; i < p->n_prefixes; i++)
+		if (ts_prefix_match(&p->prefix[i], family, addr))
+			return true;
+	return false;
+}
+
+/* Longest-prefix match of an inner destination address over every peer. */
+static struct ts_peer *peer_lookup_dst_locked(u8 family, const void *addr)
+{
+	struct ts_peer *p, *best = NULL;
+	int best_len = -1;
+	int i;
+
+	list_for_each_entry(p, &peer_list, list) {
+		for (i = 0; i < p->n_prefixes; i++) {
+			if (!ts_prefix_match(&p->prefix[i], family, addr))
+				continue;
+			if ((int)p->prefix[i].len > best_len) {
+				best_len = p->prefix[i].len;
+				best = p;
+			}
+		}
+	}
+	return best;
+}
+
+/* Egress lookup + sequence allocation in one locked section.  Copies the key,
+ * key id and endpoint so the caller never dereferences a peer outside the
+ * lock (the peer can be deleted concurrently). */
+static bool ts_egress_lookup(u8 family, const void *daddr,
+			     struct ts_egress *eg)
+{
+	struct ts_peer *p;
+	unsigned long flags;
+	bool ok = false;
+
+	spin_lock_irqsave(&cfg_lock, flags);
+	p = peer_lookup_dst_locked(family, daddr);
+	if (p && (p->key_id || psk_set)) {
+		memcpy(eg->key, p->key_id ? p->key : chacha_key,
+		       CHACHA_KEY_SIZE);
+		eg->key_id = p->key_id;
+		eg->ep.family = p->family;
+		if (p->family == AF_INET)
+			eg->ep.addr.v4 = p->addr.v4;
+		else
+			eg->ep.addr.v6 = p->addr.v6;
+		eg->seq = (u64)atomic64_inc_return(&p->tx_seq);
+		ok = eg->seq != 0;
+	}
+	spin_unlock_irqrestore(&cfg_lock, flags);
+	return ok;
+}
+
 static bool peers_empty(void)
 {
 	bool empty;
@@ -232,6 +368,13 @@ static bool peers_empty(void)
 	empty = list_empty(&peer_list);
 	spin_unlock_irqrestore(&cfg_lock, flags);
 	return empty;
+}
+
+/* True when at least one peer is configured.  A per-peer key deployment does
+ * not need the global PSK, so the hooks key off the peer list, not psk_set. */
+static bool ts_active(void)
+{
+	return !peers_empty();
 }
 
 /* ---- checksum recomputation (software path) ---------------------------- */
@@ -586,6 +729,7 @@ crypted:
 #define TS_TUN_TAG_LEN   16
 #define TS_TUN_PAD       64
 #define TS_TUN_MARK      0x5453
+#define TS_TC_MARK       0x5454         /* outer frame, skipped by the tc prog */
 #define TS_TUN_MSS4      1360
 #define TS_TUN_MSS6      1340
 /* min payload: header + one cipher block + tag */
@@ -605,7 +749,7 @@ struct ts_tun_hdr {
 } __packed;
 
 static atomic64_t st_tun_out, st_tun_in, st_tun_drop, st_tun_replay;
-static atomic64_t st_tun_rx, st_tun_peer;
+static atomic64_t st_tun_rx, st_tun_peer, st_tun_acl, st_tun_roam;
 static atomic64_t st_dev_out, st_dev_drop;
 static atomic_t ts_ip_id = ATOMIC_INIT(0);   /* outer IPv4 identification */
 
@@ -636,6 +780,35 @@ static inline u64 ts_be64(const u8 *p)
 
 	memcpy(&v, p, 8);
 	return be64_to_cpu(v);
+}
+
+static inline u32 ts_be32(const u8 *p)
+{
+	u32 v;
+
+	memcpy(&v, p, 4);
+	return be32_to_cpu(v);
+}
+
+static inline void ts_put_be32(u8 *p, u32 v)
+{
+	v = cpu_to_be32(v);
+	memcpy(p, &v, 4);
+}
+
+/* Deterministic key id derived from the peer key, so two statically configured
+ * ends agree on the wire id without a handshake.  0 is reserved for the legacy
+ * global-PSK/source-lookup mode.  Full 32-bit FNV-1a. */
+static u32 ts_key_id_for(const u8 key[CHACHA_KEY_SIZE])
+{
+	u32 h = 2166136261U;
+	int i;
+
+	for (i = 0; i < CHACHA_KEY_SIZE; i++) {
+		h ^= key[i];
+		h *= 16777619U;
+	}
+	return h ? h : 1;
 }
 
 static inline void ts_put_be64(u8 *p, u64 v)
@@ -945,6 +1118,16 @@ static void ts_tun_nonce(__be32 fold, u64 seq, u8 nonce[12])
 	ts_put_be64(nonce + 4, seq);
 }
 
+/* Nonce address fold for IPv6, computed over the *outer* addresses so both
+ * ends see the same value even when the inner and tunnel addresses differ. */
+static __be32 ts_fold_v6(const struct in6_addr *s, const struct in6_addr *d)
+{
+	return s->s6_addr32[0] ^ s->s6_addr32[1] ^
+	       s->s6_addr32[2] ^ s->s6_addr32[3] ^
+	       d->s6_addr32[0] ^ d->s6_addr32[1] ^
+	       d->s6_addr32[2] ^ d->s6_addr32[3];
+}
+
 /* ---- TCP MSS clamping -------------------------------------------------- */
 /* The outer header + tag + worst-case padding must fit in one MTU, otherwise
  * every TCP segment would be fragmented by the outer IP layer. */
@@ -985,23 +1168,67 @@ static bool ts_clamp_mss(struct tcphdr *th, unsigned int limit)
 	return false;
 }
 
-static u64 ts_next_seq(u8 family, const void *addr)
-{
-	struct ts_peer *p;
-	unsigned long flags;
-	u64 seq = 0;
+/* ---- encapsulation ----------------------------------------------------- */
+static bool ts_is_tun_dev(const struct net_device *dev);
 
-	spin_lock_irqsave(&cfg_lock, flags);
-	p = peer_find_locked(family, addr);
-	if (p)
-		seq = (u64)atomic64_inc_return(&p->tx_seq);
-	spin_unlock_irqrestore(&cfg_lock, flags);
-	return seq;
+/* Resolve the outer route to the peer endpoint and the source address the
+ * kernel selects for that route.  Rejects routes that point back into a
+ * torshield device (recursion or misconfiguration). */
+static int ts_route_outer(struct net *net, const struct ts_ep *ep, int oif,
+			  const struct net_device *self, bool v6,
+			  struct dst_entry **dstp, void *saddr)
+{
+	if (!v6) {
+		struct flowi4 fl4 = {};
+		struct rtable *rt;
+
+		fl4.daddr = ep->addr.v4;
+		fl4.flowi4_oif = oif;
+		fl4.flowi4_proto = IPPROTO_UDP;
+		rt = ip_route_output_key(net, &fl4);
+		if (IS_ERR(rt))
+			return PTR_ERR(rt);
+		if (rt->dst.dev == self || ts_is_tun_dev(rt->dst.dev)) {
+			dst_release(&rt->dst);
+			return -ELOOP;
+		}
+		*(__be32 *)saddr = fl4.saddr;
+		*dstp = &rt->dst;
+	} else {
+		struct flowi6 fl6 = {};
+		struct dst_entry *dst;
+
+		fl6.daddr = ep->addr.v6;
+		fl6.flowi6_oif = oif;
+		fl6.flowi6_proto = IPPROTO_UDP;
+		dst = ip6_dst_lookup_flow(net, NULL, &fl6, NULL);
+		if (IS_ERR(dst))
+			return PTR_ERR(dst);
+		if (dst->dev == self || ts_is_tun_dev(dst->dev)) {
+			dst_release(dst);
+			return -ELOOP;
+		}
+		/* With no socket, the lookup may leave the source unspecified.
+		 * Pick it from the output device so the outer header and the
+		 * nonce fold always agree with what is actually on the wire. */
+		if (ipv6_addr_any(&fl6.saddr)) {
+			int e = ipv6_dev_get_saddr(net, dst->dev, &fl6.daddr,
+						   0, &fl6.saddr);
+
+			if (e) {
+				dst_release(dst);
+				return e;
+			}
+		}
+		memcpy(saddr, &fl6.saddr, sizeof(fl6.saddr));
+		*dstp = dst;
+	}
+	return 0;
 }
 
-/* ---- encapsulation ----------------------------------------------------- */
 static int ts_tun_encap_v4(struct sk_buff *skb, u64 seq, const u8 key[32],
-			   struct dst_entry *hold)
+			   u32 key_id, const struct ts_ep *ep, int oif,
+			   const struct net_device *self)
 {
 	struct iphdr *iph, *oiph;
 	struct udphdr *uh;
@@ -1009,9 +1236,14 @@ static int ts_tun_encap_v4(struct sk_buff *skb, u64 seq, const u8 key[32],
 	struct sk_buff *n;
 	u8 tag[16], nonce[12];
 	u8 *payload;
+	struct dst_entry *dst;
+	__be32 saddr;
 	unsigned int ihl, inner_len, padded, total, l4_len;
 	__be32 fold;
+	int err;
 
+	if (ep->family != AF_INET)
+		return -EAFNOSUPPORT;
 	if (skb_linearize(skb) < 0)
 		return -ENOMEM;
 	iph = ip_hdr(skb);
@@ -1037,15 +1269,24 @@ static int ts_tun_encap_v4(struct sk_buff *skb, u64 seq, const u8 key[32],
 		return -EINVAL;
 	iph = ip_hdr(skb);
 
+	err = ts_route_outer(dev_net(skb->dev), ep, oif, self, false, &dst,
+			     &saddr);
+	if (err)
+		return err;
+
 	padded = round_up(inner_len, TS_TUN_PAD);
 	total = sizeof(*oiph) + sizeof(*uh) + TS_TUN_HDR_LEN + padded +
 		TS_TUN_TAG_LEN;
-	if (total > 65535)
+	if (total > 65535) {
+		dst_release(dst);
 		return -EMSGSIZE;
+	}
 
 	n = alloc_skb(total + 128, GFP_ATOMIC);
-	if (!n)
+	if (!n) {
+		dst_release(dst);
 		return -ENOMEM;
+	}
 	skb_reserve(n, 128);
 	oiph = skb_put(n, sizeof(*oiph));
 	uh = skb_put(n, sizeof(*uh));
@@ -1062,9 +1303,10 @@ static int ts_tun_encap_v4(struct sk_buff *skb, u64 seq, const u8 key[32],
 	th->magic[1] = TS_TUN_MAGIC1;
 	th->version = TS_TUN_VERSION;
 	th->flags = 0;
+	ts_put_be32((u8 *)th + 4, key_id);      /* 0 = global PSK */
 	ts_put_be64((u8 *)th + 8, seq);
 
-	fold = iph->saddr ^ iph->daddr;
+	fold = saddr ^ ep->addr.v4;
 	ts_tun_nonce(fold, seq, nonce);
 	ts_aead_seal(key, nonce, (u8 *)th, TS_TUN_HDR_LEN, payload, padded, tag);
 	memcpy(skb_put(n, TS_TUN_TAG_LEN), tag, TS_TUN_TAG_LEN);
@@ -1077,8 +1319,8 @@ static int ts_tun_encap_v4(struct sk_buff *skb, u64 seq, const u8 key[32],
 	oiph->id = htons((u16)atomic_inc_return(&ts_ip_id));
 	oiph->ttl = 64;
 	oiph->protocol = IPPROTO_UDP;
-	oiph->saddr = iph->saddr;
-	oiph->daddr = iph->daddr;
+	oiph->saddr = saddr;
+	oiph->daddr = ep->addr.v4;
 	ip_send_check(oiph);
 
 	uh->source = htons(ts_port);
@@ -1087,25 +1329,32 @@ static int ts_tun_encap_v4(struct sk_buff *skb, u64 seq, const u8 key[32],
 			sizeof(*uh));
 	uh->check = 0;                  /* legal for IPv4 */
 
-	n->dev = skb->dev;
+	n->dev = dst->dev;
 	n->protocol = htons(ETH_P_IP);
-	skb_dst_set(n, dst_clone(hold ? hold : skb_dst(skb)));
+	n->mark = TS_TC_MARK;
+	skb_dst_set(n, dst);
 	ip_local_out(dev_net(n->dev), NULL, n);
 	return 0;
 }
 
 static int ts_tun_encap_v6(struct sk_buff *skb, u64 seq, const u8 key[32],
-			   struct dst_entry *hold)
+			   u32 key_id, const struct ts_ep *ep, int oif,
+			   const struct net_device *self)
 {
 	struct ipv6hdr *ip6h, *o6;
 	struct udphdr *uh;
 	struct ts_tun_hdr *th;
 	struct sk_buff *n;
+	struct dst_entry *dst;
+	struct in6_addr saddr;
 	u8 tag[16], nonce[12];
 	u8 *payload;
 	unsigned int inner_len, padded, total, l4_len;
 	__be32 fold;
+	int err;
 
+	if (ep->family != AF_INET6)
+		return -EAFNOSUPPORT;
 	if (skb_linearize(skb) < 0)
 		return -ENOMEM;
 	ip6h = ipv6_hdr(skb);
@@ -1127,15 +1376,24 @@ static int ts_tun_encap_v6(struct sk_buff *skb, u64 seq, const u8 key[32],
 		return -EINVAL;
 	ip6h = ipv6_hdr(skb);
 
+	err = ts_route_outer(dev_net(skb->dev), ep, oif, self, true, &dst,
+			     &saddr);
+	if (err)
+		return err;
+
 	padded = round_up(inner_len, TS_TUN_PAD);
 	total = sizeof(*o6) + sizeof(*uh) + TS_TUN_HDR_LEN + padded +
 		TS_TUN_TAG_LEN;
-	if (total > 65535)
+	if (total > 65535) {
+		dst_release(dst);
 		return -EMSGSIZE;
+	}
 
 	n = alloc_skb(total + 128, GFP_ATOMIC);
-	if (!n)
+	if (!n) {
+		dst_release(dst);
 		return -ENOMEM;
+	}
 	skb_reserve(n, 128);
 	o6 = skb_put(n, sizeof(*o6));
 	uh = skb_put(n, sizeof(*uh));
@@ -1152,12 +1410,10 @@ static int ts_tun_encap_v6(struct sk_buff *skb, u64 seq, const u8 key[32],
 	th->magic[1] = TS_TUN_MAGIC1;
 	th->version = TS_TUN_VERSION;
 	th->flags = 1;                  /* inner is IPv6 */
+	ts_put_be32((u8 *)th + 4, key_id);      /* 0 = global PSK */
 	ts_put_be64((u8 *)th + 8, seq);
 
-	fold = ip6h->saddr.s6_addr32[0] ^ ip6h->saddr.s6_addr32[1] ^
-	       ip6h->saddr.s6_addr32[2] ^ ip6h->saddr.s6_addr32[3] ^
-	       ip6h->daddr.s6_addr32[0] ^ ip6h->daddr.s6_addr32[1] ^
-	       ip6h->daddr.s6_addr32[2] ^ ip6h->daddr.s6_addr32[3];
+	fold = ts_fold_v6(&saddr, &ep->addr.v6);
 	ts_tun_nonce(fold, seq, nonce);
 	ts_aead_seal(key, nonce, (u8 *)th, TS_TUN_HDR_LEN, payload, padded, tag);
 	memcpy(skb_put(n, TS_TUN_TAG_LEN), tag, TS_TUN_TAG_LEN);
@@ -1166,8 +1422,8 @@ static int ts_tun_encap_v6(struct sk_buff *skb, u64 seq, const u8 key[32],
 	o6->version = 6;
 	o6->nexthdr = IPPROTO_UDP;
 	o6->hop_limit = 64;
-	o6->saddr = ip6h->saddr;
-	o6->daddr = ip6h->daddr;
+	o6->saddr = saddr;
+	o6->daddr = ep->addr.v6;
 
 	uh->source = htons(ts_port);
 	uh->dest = htons(ts_port);
@@ -1178,9 +1434,10 @@ static int ts_tun_encap_v6(struct sk_buff *skb, u64 seq, const u8 key[32],
 	n->csum_start = skb_transport_offset(n);
 	n->csum_offset = offsetof(struct udphdr, check);
 
-	n->dev = skb->dev;
+	n->dev = dst->dev;
 	n->protocol = htons(ETH_P_IPV6);
-	skb_dst_set(n, dst_clone(hold ? hold : skb_dst(skb)));
+	n->mark = TS_TC_MARK;
+	skb_dst_set(n, dst);
 	ip6_local_out(dev_net(n->dev), NULL, n);
 	return 0;
 }
@@ -1211,6 +1468,9 @@ static unsigned int ts_tun_decap(struct sk_buff *skb, bool outer_v6,
 	unsigned long flags;
 	const u8 *ct;
 	const u8 *tag;
+	const void *inner_src;
+	u8 inner_family;
+	u32 key_id;
 	u64 seq;
 	bool v6;
 	__be32 fold;
@@ -1247,27 +1507,31 @@ static unsigned int ts_tun_decap(struct sk_buff *skb, bool outer_v6,
 	ct = (u8 *)th + TS_TUN_HDR_LEN;
 	tag = ct + ct_len;
 
+	key_id = ts_be32((u8 *)th + 4);
+
 	spin_lock_irqsave(&cfg_lock, flags);
-	p = outer_v6 ? peer_find_locked(AF_INET6, &ipv6_hdr(skb)->saddr)
-		     : peer_find_locked(AF_INET, &ip_hdr(skb)->saddr);
-	if (!p) {
-		spin_unlock_irqrestore(&cfg_lock, flags);
+	if (key_id) {
+		p = peer_find_id_locked(key_id);
+		if (p)
+			memcpy(key, p->key, sizeof(key));
+	} else {
+		p = outer_v6 ? peer_find_locked(AF_INET6,
+						&ipv6_hdr(skb)->saddr)
+			     : peer_find_locked(AF_INET, &ip_hdr(skb)->saddr);
+		if (p && p->key_id)
+			p = NULL;       /* has a key id: not address-identified */
+		if (p && psk_set)
+			memcpy(key, chacha_key, sizeof(key));
+	}
+	spin_unlock_irqrestore(&cfg_lock, flags);
+	if (!p || (!key_id && !psk_set)) {
 		ts_note_nonpeer(skb, outer_v6, seq);
 		return NF_DROP;         /* tunnel framing from an unknown peer */
 	}
-	memcpy(key, chacha_key, sizeof(key));
-	spin_unlock_irqrestore(&cfg_lock, flags);
 
-	fold = (th->flags & 1) ?
-	       (ipv6_hdr(skb)->saddr.s6_addr32[0] ^
-		ipv6_hdr(skb)->saddr.s6_addr32[1] ^
-		ipv6_hdr(skb)->saddr.s6_addr32[2] ^
-		ipv6_hdr(skb)->saddr.s6_addr32[3] ^
-		ipv6_hdr(skb)->daddr.s6_addr32[0] ^
-		ipv6_hdr(skb)->daddr.s6_addr32[1] ^
-		ipv6_hdr(skb)->daddr.s6_addr32[2] ^
-		ipv6_hdr(skb)->daddr.s6_addr32[3])
-	      : (ip_hdr(skb)->saddr ^ ip_hdr(skb)->daddr);
+	fold = outer_v6 ? ts_fold_v6(&ipv6_hdr(skb)->saddr,
+				     &ipv6_hdr(skb)->daddr)
+			: (ip_hdr(skb)->saddr ^ ip_hdr(skb)->daddr);
 
 	/* Authenticate before touching the replay window: an off-path packet
 	 * must not be able to advance it. */
@@ -1280,21 +1544,6 @@ static unsigned int ts_tun_decap(struct sk_buff *skb, bool outer_v6,
 		return NF_DROP;
 	}
 
-	spin_lock_irqsave(&cfg_lock, flags);
-	p = outer_v6 ? peer_find_locked(AF_INET6, &ipv6_hdr(skb)->saddr)
-		     : peer_find_locked(AF_INET, &ip_hdr(skb)->saddr);
-	if (!p) {
-		spin_unlock_irqrestore(&cfg_lock, flags);
-		ts_note_nonpeer(skb, outer_v6, seq);
-		return NF_DROP;
-	}
-	if (!ts_replay_ok(p, seq)) {
-		spin_unlock_irqrestore(&cfg_lock, flags);
-		atomic64_inc(&st_tun_replay);
-		return NF_DROP;
-	}
-	spin_unlock_irqrestore(&cfg_lock, flags);
-
 	v6 = (th->flags & 1) != 0;
 	if (v6) {
 		struct ipv6hdr *in = (struct ipv6hdr *)ct;
@@ -1304,6 +1553,8 @@ static unsigned int ts_tun_decap(struct sk_buff *skb, bool outer_v6,
 			goto bad;
 		}
 		inner_len = sizeof(*in) + ntohs(in->payload_len);
+		inner_src = &in->saddr;
+		inner_family = AF_INET6;
 	} else {
 		struct iphdr *in = (struct iphdr *)ct;
 
@@ -1316,11 +1567,62 @@ static unsigned int ts_tun_decap(struct sk_buff *skb, bool outer_v6,
 			bad_reason = 4;
 			goto bad;
 		}
+		inner_src = &in->saddr;
+		inner_family = AF_INET;
 	}
 	if (inner_len > ct_len) {
 		bad_reason = 4;
 		goto bad;
 	}
+
+	spin_lock_irqsave(&cfg_lock, flags);
+	if (key_id) {
+		p = peer_find_id_locked(key_id);
+	} else {
+		p = outer_v6 ? peer_find_locked(AF_INET6,
+						&ipv6_hdr(skb)->saddr)
+			     : peer_find_locked(AF_INET, &ip_hdr(skb)->saddr);
+		if (p && p->key_id)
+			p = NULL;
+	}
+	if (!p) {
+		spin_unlock_irqrestore(&cfg_lock, flags);
+		ts_note_nonpeer(skb, outer_v6, seq);
+		return NF_DROP;
+	}
+	if (!ts_replay_ok(p, seq)) {
+		spin_unlock_irqrestore(&cfg_lock, flags);
+		atomic64_inc(&st_tun_replay);
+		return NF_DROP;
+	}
+	/* Cryptokey routing: the decrypted inner source must be inside one of
+	 * this peer's allowed prefixes. */
+	if (!ts_peer_allows(p, inner_family, inner_src)) {
+		spin_unlock_irqrestore(&cfg_lock, flags);
+		atomic64_inc(&st_tun_acl);
+		return NF_DROP;
+	}
+	if (key_id) {
+		/* Endpoint roaming: authenticated traffic from a new address moves
+		 * the peer's outer destination (WireGuard-style). */
+		if (outer_v6) {
+			if (p->family != AF_INET6 ||
+			    !ipv6_addr_equal(&p->addr.v6,
+					     &ipv6_hdr(skb)->saddr)) {
+				p->family = AF_INET6;
+				p->addr.v6 = ipv6_hdr(skb)->saddr;
+				atomic64_inc(&st_tun_roam);
+			}
+		} else {
+			if (p->family != AF_INET ||
+			    p->addr.v4 != ip_hdr(skb)->saddr) {
+				p->family = AF_INET;
+				p->addr.v4 = ip_hdr(skb)->saddr;
+				atomic64_inc(&st_tun_roam);
+			}
+		}
+	}
+	spin_unlock_irqrestore(&cfg_lock, flags);
 
 	n = alloc_skb(inner_len + 128, GFP_ATOMIC);
 	if (!n) {
@@ -1403,11 +1705,7 @@ static bool ts_v4_local_scope(__be32 a)
 static unsigned int ts_tun_out(struct sk_buff *skb, bool v6)
 {
 	struct sk_buff *segs, *seg;
-	struct dst_entry *hold;
-	unsigned long flags;
-	struct ts_peer *p;
-	u8 key[32];
-	u64 seq;
+	struct ts_egress eg;
 	int err;
 
 	if (skb->mark == TS_TUN_MARK)
@@ -1422,30 +1720,22 @@ static unsigned int ts_tun_out(struct sk_buff *skb, bool v6)
 	}
 	if (!skb_dst(skb))
 		return NF_ACCEPT;
-	/* Hybrid: packets routed into a torshield netdevice are encapsulated by
-	 * that device's ndo_start_xmit, not here.  Everything else keeps the
+	/* Hybrid/TC: packets routed into a torshield netdevice are encapsulated
+	 * by that device's ndo_start_xmit, not here.  Everything else keeps the
 	 * transparent netfilter path, so both datapaths can coexist. */
 	if (READ_ONCE(ts_mode) == TS_MODE_HYBRID &&
 	    ts_is_tun_dev(skb_dst(skb)->dev))
 		return NF_ACCEPT;
 
-	spin_lock_irqsave(&cfg_lock, flags);
-	p = v6 ? peer_find_locked(AF_INET6, &ipv6_hdr(skb)->daddr)
-	       : peer_find_locked(AF_INET, &ip_hdr(skb)->daddr);
-	if (p)
-		memcpy(key, chacha_key, sizeof(key));
-	spin_unlock_irqrestore(&cfg_lock, flags);
-	if (!p)
-		return NF_ACCEPT;
-
 	if (!skb_is_gso(skb)) {
-		seq = ts_next_seq(v6 ? AF_INET6 : AF_INET,
-				  v6 ? (void *)&ipv6_hdr(skb)->daddr
-				     : (void *)&ip_hdr(skb)->daddr);
-		if (!seq)
+		if (!ts_egress_lookup(v6 ? AF_INET6 : AF_INET,
+				      v6 ? (void *)&ipv6_hdr(skb)->daddr
+					 : (void *)&ip_hdr(skb)->daddr, &eg))
 			return NF_ACCEPT;
-		err = v6 ? ts_tun_encap_v6(skb, seq, key, NULL)
-			 : ts_tun_encap_v4(skb, seq, key, NULL);
+		err = v6 ? ts_tun_encap_v6(skb, eg.seq, eg.key, eg.key_id,
+					   &eg.ep, 0, NULL)
+			 : ts_tun_encap_v4(skb, eg.seq, eg.key, eg.key_id,
+					   &eg.ep, 0, NULL);
 		if (err) {
 			atomic64_inc(&st_tun_drop);
 			return NF_DROP;
@@ -1455,10 +1745,8 @@ static unsigned int ts_tun_out(struct sk_buff *skb, bool v6)
 		return NF_STOLEN;
 	}
 
-	hold = dst_clone(skb_dst(skb));
 	segs = skb_gso_segment(skb, 0);
 	if (IS_ERR(segs)) {
-		dst_release(hold);
 		atomic64_inc(&st_tun_drop);
 		return NF_DROP;
 	}
@@ -1469,14 +1757,15 @@ static unsigned int ts_tun_out(struct sk_buff *skb, bool v6)
 		struct sk_buff *next = seg->next;
 
 		seg->next = NULL;
-		seq = ts_next_seq(v6 ? AF_INET6 : AF_INET,
-				  v6 ? (void *)&ipv6_hdr(seg)->daddr
-				     : (void *)&ip_hdr(seg)->daddr);
-		if (!seq) {
+		if (!ts_egress_lookup(v6 ? AF_INET6 : AF_INET,
+				      v6 ? (void *)&ipv6_hdr(seg)->daddr
+					 : (void *)&ip_hdr(seg)->daddr, &eg)) {
 			kfree_skb(seg);
 		} else {
-			err = v6 ? ts_tun_encap_v6(seg, seq, key, hold)
-				 : ts_tun_encap_v4(seg, seq, key, hold);
+			err = v6 ? ts_tun_encap_v6(seg, eg.seq, eg.key,
+						   eg.key_id, &eg.ep, 0, NULL)
+				 : ts_tun_encap_v4(seg, eg.seq, eg.key,
+						   eg.key_id, &eg.ep, 0, NULL);
 			if (err) {
 				atomic64_inc(&st_tun_drop);
 				kfree_skb(seg);
@@ -1484,7 +1773,6 @@ static unsigned int ts_tun_out(struct sk_buff *skb, bool v6)
 		}
 		seg = next;
 	}
-	dst_release(hold);
 	return NF_STOLEN;
 }
 
@@ -1541,13 +1829,7 @@ struct ts_priv {
 static netdev_tx_t ts_ndo_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct ts_priv *priv = netdev_priv(dev);
-	struct ts_peer *p;
-	struct dst_entry *dst = NULL;
-	struct flowi4 fl4 = {};
-	struct flowi6 fl6 = {};
-	unsigned long flags;
-	u8 key[32];
-	u64 seq = 0;
+	struct ts_egress eg;
 	bool v6;
 	int err, reason = 0;
 
@@ -1577,55 +1859,17 @@ static netdev_tx_t ts_ndo_start_xmit(struct sk_buff *skb, struct net_device *dev
 	       : ts_v4_local_scope(ip_hdr(skb)->daddr))
 		goto consume;
 
-	spin_lock_irqsave(&cfg_lock, flags);
-	p = v6 ? peer_find_locked(AF_INET6, &ipv6_hdr(skb)->daddr)
-	       : peer_find_locked(AF_INET, &ip_hdr(skb)->daddr);
-	if (p) {
-		memcpy(key, chacha_key, sizeof(key));
-		seq = (u64)atomic64_inc_return(&p->tx_seq);
-	}
-	spin_unlock_irqrestore(&cfg_lock, flags);
-	if (!seq) {
+	if (!ts_egress_lookup(v6 ? AF_INET6 : AF_INET,
+			      v6 ? (void *)&ipv6_hdr(skb)->daddr
+				 : (void *)&ip_hdr(skb)->daddr, &eg)) {
 		reason = 3;
 		goto drop;
 	}
 
-	if (v6) {
-		fl6.daddr = ipv6_hdr(skb)->daddr;
-		fl6.flowi6_oif = priv->link;
-		fl6.flowi6_proto = IPPROTO_UDP;
-		dst = ip6_route_output(dev_net(dev), NULL, &fl6);
-		if (IS_ERR(dst)) {
-			dst = NULL;
-			reason = 4;
-			goto drop;
-		}
-		if (dst->dev == dev) {  /* misconfiguration: would recurse */
-			dst_release(dst);
-			reason = 5;
-			goto drop;
-		}
-		err = ts_tun_encap_v6(skb, seq, key, dst);
-		dst_release(dst);
-	} else {
-		struct rtable *rt;
-
-		fl4.daddr = ip_hdr(skb)->daddr;
-		fl4.flowi4_oif = priv->link;
-		fl4.flowi4_proto = IPPROTO_UDP;
-		rt = ip_route_output_key(dev_net(dev), &fl4);
-		if (IS_ERR(rt)) {
-			reason = 4;
-			goto drop;
-		}
-		if (rt->dst.dev == dev) {
-			dst_release(&rt->dst);
-			reason = 5;
-			goto drop;
-		}
-		err = ts_tun_encap_v4(skb, seq, key, &rt->dst);
-		dst_release(&rt->dst);
-	}
+	err = v6 ? ts_tun_encap_v6(skb, eg.seq, eg.key, eg.key_id, &eg.ep,
+				   priv->link, dev)
+		 : ts_tun_encap_v4(skb, eg.seq, eg.key, eg.key_id, &eg.ep,
+				   priv->link, dev);
 	if (!err) {
 		dev->stats.tx_packets++;
 		dev->stats.tx_bytes += skb->len;
@@ -1722,27 +1966,31 @@ static bool ts_is_tun_dev(const struct net_device *dev)
 static unsigned int hook_v4_out(void *priv, struct sk_buff *skb,
 				const struct nf_hook_state *state)
 {
-	if (!skb || !READ_ONCE(psk_set) || peers_empty())
+	if (!skb || !ts_active())
 		return NF_ACCEPT;
 	if (READ_ONCE(ts_mode) != TS_MODE_STREAM)
 		return ts_tun_out(skb, false);
+	if (!READ_ONCE(psk_set))
+		return NF_ACCEPT;
 	return process_v4(skb, true);
 }
 
 static unsigned int hook_v4_in(void *priv, struct sk_buff *skb,
 			       const struct nf_hook_state *state)
 {
-	if (!skb || !READ_ONCE(psk_set) || peers_empty())
+	if (!skb || !ts_active())
 		return NF_ACCEPT;
 	if (READ_ONCE(ts_mode) != TS_MODE_STREAM)
 		return NF_ACCEPT;       /* tunnel decapsulates at LOCAL_IN */
+	if (!READ_ONCE(psk_set))
+		return NF_ACCEPT;
 	return process_v4(skb, false);
 }
 
 static unsigned int hook_v4_local(void *priv, struct sk_buff *skb,
 				  const struct nf_hook_state *state)
 {
-	if (!skb || !READ_ONCE(psk_set) || peers_empty())
+	if (!skb || !ts_active())
 		return NF_ACCEPT;
 	if (READ_ONCE(ts_mode) == TS_MODE_STREAM)
 		return NF_ACCEPT;
@@ -1752,19 +2000,23 @@ static unsigned int hook_v4_local(void *priv, struct sk_buff *skb,
 static unsigned int hook_v6_out(void *priv, struct sk_buff *skb,
 				const struct nf_hook_state *state)
 {
-	if (!skb || !READ_ONCE(psk_set) || peers_empty())
+	if (!skb || !ts_active())
 		return NF_ACCEPT;
 	if (READ_ONCE(ts_mode) != TS_MODE_STREAM)
 		return ts_tun_out(skb, true);
+	if (!READ_ONCE(psk_set))
+		return NF_ACCEPT;
 	return process_v6(skb, true);
 }
 
 static unsigned int hook_v6_in(void *priv, struct sk_buff *skb,
 			       const struct nf_hook_state *state)
 {
-	if (!skb || !READ_ONCE(psk_set) || peers_empty())
+	if (!skb || !ts_active())
 		return NF_ACCEPT;
 	if (READ_ONCE(ts_mode) != TS_MODE_STREAM)
+		return NF_ACCEPT;
+	if (!READ_ONCE(psk_set))
 		return NF_ACCEPT;
 	return process_v6(skb, false);
 }
@@ -1772,7 +2024,7 @@ static unsigned int hook_v6_in(void *priv, struct sk_buff *skb,
 static unsigned int hook_v6_local(void *priv, struct sk_buff *skb,
 				  const struct nf_hook_state *state)
 {
-	if (!skb || !READ_ONCE(psk_set) || peers_empty())
+	if (!skb || !ts_active())
 		return NF_ACCEPT;
 	if (READ_ONCE(ts_mode) == TS_MODE_STREAM)
 		return NF_ACCEPT;
@@ -1839,19 +2091,44 @@ static const struct proc_ops psk_fops = {
 };
 
 /* ---- /proc/torshield/peers --------------------------------------------- */
-/* read: list peers. write: "+<addr>" to add, "-<addr>" to remove,
- * "clear" to drop all. v4 and v6 literals accepted. */
+/* read: one peer per line:
+ *      <endpoint> key=global|key=<id> allowed=<prefix>[,<prefix>...]
+ * write: "+<endpoint> [key <64hex>] [allowed <prefix>[,<prefix>...]]" to add,
+ *        "-<endpoint>" to remove, "clear" to drop all.
+ * A plain "+<endpoint>" is a legacy peer: global PSK and the endpoint host as
+ * its only allowed prefix.  Supplying "key" assigns a key id and enables
+ * cryptokey routing and endpoint roaming for that peer. */
+static void ts_prefix_show(struct seq_file *m, const struct ts_prefix *pf)
+{
+	if (pf->family == AF_INET)
+		seq_printf(m, "%pI4/%u", &pf->addr.v4, pf->len);
+	else
+		seq_printf(m, "%pI6c/%u", &pf->addr.v6, pf->len);
+}
+
 static int peers_show(struct seq_file *m, void *v)
 {
 	struct ts_peer *p;
+	int i;
 	unsigned long flags;
 
 	spin_lock_irqsave(&cfg_lock, flags);
 	list_for_each_entry(p, &peer_list, list) {
 		if (p->family == AF_INET)
-			seq_printf(m, "%pI4\n", &p->addr.v4);
+			seq_printf(m, "%pI4", &p->addr.v4);
 		else
-			seq_printf(m, "%pI6c\n", &p->addr.v6);
+			seq_printf(m, "%pI6c", &p->addr.v6);
+		if (p->key_id)
+			seq_printf(m, " key=%u", p->key_id);
+		else
+			seq_puts(m, " key=global");
+		seq_puts(m, " allowed=");
+		for (i = 0; i < p->n_prefixes; i++) {
+			if (i)
+				seq_putc(m, ',');
+			ts_prefix_show(m, &p->prefix[i]);
+		}
+		seq_putc(m, '\n');
 	}
 	spin_unlock_irqrestore(&cfg_lock, flags);
 	return 0;
@@ -1890,55 +2167,65 @@ static int parse_addr(const char *s, u8 *family, void *out)
 	return -EINVAL;
 }
 
+static int parse_prefix(const char *s, struct ts_prefix *pf)
+{
+	char buf[64];
+	const char *slash = strchr(s, '/');
+	size_t alen = slash ? (size_t)(slash - s) : strlen(s);
+	int len;
+
+	if (!alen || alen >= sizeof(buf))
+		return -EINVAL;
+	memcpy(buf, s, alen);
+	buf[alen] = '\0';
+	if (parse_addr(buf, &pf->family, &pf->addr))
+		return -EINVAL;
+	len = pf->family == AF_INET ? 32 : 128;
+	if (slash && kstrtoint(slash + 1, 10, &len))
+		return -EINVAL;
+	if (len < 0 || len > (pf->family == AF_INET ? 32 : 128))
+		return -EINVAL;
+	pf->len = (u8)len;
+	return 0;
+}
+
 static ssize_t peers_write(struct file *file, const char __user *ubuf,
 			   size_t count, loff_t *pos)
 {
-	char buf[64];
-	char *s;
+	char *buf, *s, *tok;
 	u8 family;
 	union { __be32 v4; struct in6_addr v6; } addr;
 	struct ts_peer *p, *tmp;
 	unsigned long flags;
-	bool add;
+	bool add, added = false;
+	int i, ret = -EINVAL;
 
-	if (count == 0 || count >= sizeof(buf))
+	if (count == 0 || count > 1024)
 		return -EINVAL;
-	if (copy_from_user(buf, ubuf, count))
-		return -EFAULT;
-	buf[count] = '\0';
+	buf = kzalloc(count + 1, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	if (copy_from_user(buf, ubuf, count)) {
+		ret = -EFAULT;
+		goto out;
+	}
 	s = strim(buf);
 
-	if (strcmp(s, "clear") == 0) {
+	if (!strcmp(s, "clear")) {
 		peers_clear();
+		kfree(buf);
 		return count;
 	}
 	if (s[0] != '+' && s[0] != '-')
-		return -EINVAL;
+		goto out;
 	add = (s[0] == '+');
-	s++;
+	s = strim(s + 1);
 
-	if (parse_addr(s, &family, &addr))
-		return -EINVAL;
+	tok = strsep(&s, " \t");
+	if (!tok || !*tok || parse_addr(tok, &family, &addr))
+		goto out;
 
-	if (add) {
-		p = kzalloc(sizeof(*p), GFP_KERNEL);
-		if (!p)
-			return -ENOMEM;
-		p->family = family;
-		if (family == AF_INET)
-			p->addr.v4 = addr.v4;
-		else
-			p->addr.v6 = addr.v6;
-
-		spin_lock_irqsave(&cfg_lock, flags);
-		if (!peer_match_locked(family,
-				       family == AF_INET ? (void *)&addr.v4
-							 : (void *)&addr.v6))
-			list_add_tail(&p->list, &peer_list);
-		else
-			kfree(p);          /* already present */
-		spin_unlock_irqrestore(&cfg_lock, flags);
-	} else {
+	if (!add) {
 		spin_lock_irqsave(&cfg_lock, flags);
 		list_for_each_entry_safe(p, tmp, &peer_list, list) {
 			if (p->family != family)
@@ -1952,8 +2239,86 @@ static ssize_t peers_write(struct file *file, const char __user *ubuf,
 			}
 		}
 		spin_unlock_irqrestore(&cfg_lock, flags);
+		ret = count;
+		goto out;
 	}
-	return count;
+
+	p = kzalloc(sizeof(*p), GFP_KERNEL);
+	if (!p) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	p->family = family;
+	if (family == AF_INET)
+		p->addr.v4 = addr.v4;
+	else
+		p->addr.v6 = addr.v6;
+	/* Default cryptokey-routing entry: the endpoint host itself. */
+	p->prefix[0].family = family;
+	p->prefix[0].len = family == AF_INET ? 32 : 128;
+	if (family == AF_INET)
+		p->prefix[0].addr.v4 = addr.v4;
+	else
+		p->prefix[0].addr.v6 = addr.v6;
+	p->n_prefixes = 1;
+
+	while ((tok = strsep(&s, " \t")) != NULL) {
+		if (!*tok)
+			continue;
+		if (!strcmp(tok, "key")) {
+			char *hex = strsep(&s, " \t");
+
+			if (!hex || strlen(hex) != 2 * CHACHA_KEY_SIZE)
+				goto free_peer;
+			for (i = 0; i < CHACHA_KEY_SIZE; i++) {
+				int hi = hex_to_bin(hex[2 * i]);
+				int lo = hex_to_bin(hex[2 * i + 1]);
+
+				if (hi < 0 || lo < 0)
+					goto free_peer;
+				p->key[i] = (hi << 4) | lo;
+			}
+			p->key_id = ts_key_id_for(p->key);
+		} else if (!strcmp(tok, "allowed")) {
+			char *list = strsep(&s, " \t");
+			char *one;
+
+			if (!list || !*list)
+				goto free_peer;
+			p->n_prefixes = 0;
+			while ((one = strsep(&list, ",")) != NULL) {
+				if (!*one ||
+				    p->n_prefixes >= TS_MAX_PREFIXES ||
+				    parse_prefix(one,
+						 &p->prefix[p->n_prefixes]))
+					goto free_peer;
+				p->n_prefixes++;
+			}
+			if (!p->n_prefixes)
+				goto free_peer;
+		} else {
+			goto free_peer;
+		}
+	}
+
+	spin_lock_irqsave(&cfg_lock, flags);
+	if (!peer_match_locked(family,
+			       family == AF_INET ? (void *)&addr.v4
+						 : (void *)&addr.v6)) {
+		list_add_tail(&p->list, &peer_list);
+		added = true;
+	}
+	spin_unlock_irqrestore(&cfg_lock, flags);
+	if (!added)
+		kfree(p);               /* already present */
+	ret = count;
+	goto out;
+
+free_peer:
+	kfree(p);
+out:
+	kfree(buf);
+	return ret;
 }
 
 static const struct proc_ops peers_fops = {
@@ -2045,6 +2410,8 @@ static int stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "tun_drop  %lld\n", (long long)atomic64_read(&st_tun_drop));
 	seq_printf(m, "tun_replay %lld\n",
 		   (long long)atomic64_read(&st_tun_replay));
+	seq_printf(m, "tun_acl   %lld\n", (long long)atomic64_read(&st_tun_acl));
+	seq_printf(m, "tun_roam  %lld\n", (long long)atomic64_read(&st_tun_roam));
 	seq_printf(m, "dev_out   %lld\n", (long long)atomic64_read(&st_dev_out));
 	seq_printf(m, "dev_drop  %lld\n", (long long)atomic64_read(&st_dev_drop));
 	return 0;

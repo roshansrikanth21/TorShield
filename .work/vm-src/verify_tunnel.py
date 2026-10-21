@@ -120,6 +120,7 @@ def main():
             print("short payload")
             continue
         hdr = payload[:16]
+        key_id = struct.unpack("!I", hdr[4:8])[0]
         seq = struct.unpack("!Q", hdr[8:16])[0]
         ct = payload[16:-16]
         tag = payload[-16:]
@@ -135,8 +136,9 @@ def main():
             if m is not None:
                 mss_seen.append(m)
             if n <= 5:
-                print("packet %d: seq=%d ct=%d inner=%d ver=%d proto=%d %s -> %s mss=%s"
-                      % (n, seq, len(ct), len(inner), inner[0] >> 4, inner[9],
+                print("packet %d: kid=%u seq=%d ct=%d inner=%d ver=%d proto=%d %s -> %s mss=%s"
+                      % (n, key_id, seq, len(ct), len(inner), inner[0] >> 4,
+                         inner[9],
                          ".".join(map(str, inner[12:16])),
                          ".".join(map(str, inner[16:20])), m))
     print("tunnel_packets=%d authenticated=%d" % (n, ok))
