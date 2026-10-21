@@ -22,7 +22,7 @@ Claims are labelled `BUILD-VERIFIED`, `RUNTIME-VERIFIED`, or `STATIC-ONLY`.
 | Tunnel integrity (v4 1 MB, v6 256 KB) | **DONE** — 100% byte-exact, independent AEAD verification |
 | Tunnel replay / tamper / non-peer | **DONE** — all dropped, counters exact |
 | Tunnel control plane | **DONE (procfs)** — mode, key, peers, stats |
-| **Hybrid TUN networking (exploration)** | **NEXT — design + prototype** |
+| **Hybrid TUN networking** | **DONE (prototype)** — `torshield0` netdevice, v4 + v6 verified |
 | CI, docs, paper | **TODO** (P2/P3) |
 
 **Critical correction to earlier claims:** before this session the module silently left bulk
@@ -155,14 +155,16 @@ fragmentation and reassembly (not yet tested); single shared PSK.
 - [ ] Length-preserving MAC alternative for stream mode, or explicitly drop its integrity claim
 - [ ] Fix TCP seq wrap in stream mode (rekey per flow at ~2 GB, or counter-based nonce)
 
-### P2.5 — Hybrid TUN networking (exploration, in progress)
-- [ ] Virtual L3 netdevice (`torshield0`) with `ndo_start_xmit` reusing the tunnel AEAD/framing
-- [ ] Route-based steering (`ip route … dev torshield0`) instead of netfilter peer matching
-- [ ] Underlay route lookup that cannot recurse into the tunnel device (oif-pinned lookup)
-- [ ] Receive path: deliver decapped packets through the tunnel netdevice
+### P2.5 — Hybrid TUN networking (prototype done, see `TUN-HYBRID.md`)
+- [x] Virtual L3 netdevice (`torshield0`) with `ndo_start_xmit` reusing the tunnel AEAD/framing (R28)
+- [x] Route-based steering (`ip route … dev torshield0`) instead of netfilter peer matching (R28)
+- [x] Underlay route lookup pinned to `IFLA_LINK`, with a recursion guard (R29)
+- [x] Coexistence: netfilter skip for packets routed into a `torshield` device (`TS_MODE_HYBRID`)
+- [x] Interop test: netfilter-transparent peer ↔ TUN peer on the same wire format (R29/R30)
+- [ ] Receive path: deliver decapped packets through the tunnel netdevice (today: stack inject)
 - [ ] Decide inner-vs-outer address model (same address today; separate tunnel/underlay
-      addresses are needed for a general route-based deployment)
-- [ ] Interop test: netfilter-transparent side ↔ TUN side on the same wire format
+      addresses + endpoint mapping are needed for a general route-based deployment)
+- [ ] Advertise GSO/TSO and segment in the driver (currently no offloads; stack segments to MTU)
 
 ### P3 — Operations, tests, docs
 - [ ] Netlink control plane (replace procfs), kill switch, safe mode, dry-run
@@ -211,6 +213,10 @@ Environment: Ubuntu 24.04 cloud image, kernel `6.8.0-147-generic`, QEMU 8.2 TCG 
 | R25 | Replay / tamper / unknown peer (stage16 §4 + stage17) | replay dropped (`tun_replay 1`), tampered new sequence dropped (`tun_drop 1`), framed packet from unknown source dropped (`tun_peer 1`); final `tun_rx = tun_in + 2` exactly; no kernel oops/panic |
 | R26 | Interop: tunnel packet built by an independent Python ChaCha20-Poly1305 sender (`inject.py`) | **accepted and delivered** (`RX b'FROM-PYTHON'`, `tun_in` +1) — format and nonce/AAD agree in both directions |
 | R27 | Regression for D2.4: IPv6 neighbour advertisements (src `fe80::…`) | no longer encapsulated; `tun_peer 0` (was 3 per run before the link-scope guard) |
+| R28 | Hybrid: `ip -n n1 link add name torshield0 link veth1 type torshield` + `ip route add 10.0.0.2/32 dev torshield0`, mode `hybrid` | device created (`rc=0`, MTU 1360, `noqueue`); small TCP marker `HYBRID_OK`; `dev_out 5`, `dev_drop 0` |
+| R29 | Hybrid: TCP 1 MB through `ndo_start_xmit` (n1 device → n2 netfilter decap; n2 replies via netfilter) | **1048576/1048576 correct (100%)**; 807 outer frames, 807 valid headers, 0 bad padding, 0 plaintext; **807/807 authenticated** by `verify_tunnel.py`; inner SYN MSS **1320**; totals `dev_out 1020`, `dev_drop 0`, `tun_out 173` (both datapaths in one run) |
+| R30 | Hybrid: IPv6 TCP 256 KB through `ndo_start_xmit` | **262144/262144 correct (100%)**; 208 outer frames, 208 valid headers, 0 bad padding; **208/208 authenticated** (`ver=6`) |
+| R31 | Defect found by testing: IPv6 router solicitations (48-byte ICMPv6, dst `ff02::2`) reached `ndo_start_xmit` and were counted as malformed (`dev_drop 3–5/run`) | fixed with a multicast/link-local guard; `dev_drop 0` |
 
 > R19/R20 are **not paper-grade**: TCG-emulated CPU. They show the direction and the overhead
 > source (per-byte software ChaCha20 + linearise), not real-hardware numbers.
@@ -232,6 +238,8 @@ WSL2 (no root) ── QEMU 8.2 TCG ── Ubuntu 24.04, 6.8.0-147-generic
 * Stream-mode tests: `.work/vm-src/stage{1..15}.sh`, pcap analyser `.work/vm-src/pcap.py`.
 * Tunnel tests: `.work/vm-src/stage16.sh` (acceptance: build, load, TCP v4/v6, UDP,
   replay, tamper) and `.work/vm-src/stage17.sh` (replay/tamper/unknown-peer/interop).
+  Hybrid device test: `.work/vm-src/stage18.sh` (device creation, v4 + v6 through
+  `ndo_start_xmit`, coexistence with the netfilter path).
   Independent checks: `verify_tunnel.py` (decrypts the capture with python-`cryptography`),
   `inject.py` (builds tunnel packets from scratch), `replay.py` (replays captured frames).
 
@@ -263,6 +271,14 @@ WSL2 (no root) ── QEMU 8.2 TCG ── Ubuntu 24.04, 6.8.0-147-generic
 11. Control plane is procfs, not netlink; no kill switch/dry-run/safe mode.
 12. No real-hardware throughput numbers yet.
 
+**Hybrid (TUN netdevice) prototype — see `TUN-HYBRID.md`:**
+
+13. **Same inner/outer addresses**; no endpoint mapping or policy routing yet, so overlapping
+    inner prefixes cannot be supported.
+14. **No offloads on the device** (no GSO/TSO); the stack segments to the 1360-byte MTU.
+15. Mode is **global**, not per-netns; ingress is still injected by the netfilter decap rather
+    than delivered through the tunnel device (so `rp_filter`/policy routing do not see it).
+
 ---
 
 ## I. Open questions for Roshan
@@ -271,9 +287,10 @@ WSL2 (no root) ── QEMU 8.2 TCG ── Ubuntu 24.04, 6.8.0-147-generic
    receive an `sk_buff`. Did you mean (a) TC clsact/eBPF on `sk_buff`, (b) kprobes on
    `tcp_sendmsg`/socket-level functions, (c) a netfilter hook that works on skb head/sg data
    directly (which is what the tunnel now does), or (d) an explicit virtual netdevice?
-2. **Hybrid TUN** — confirm the interpretation: a kernel virtual L3 interface (`torshield0`)
-   steered by routes and reusing the UDP AEAD framing, or `tun(4)` plus a userspace daemon?
-   This decides whether the inner/outer addresses must become distinct.
+2. **Hybrid TUN** — interpretation confirmed and implemented: a kernel virtual L3 interface
+   (`torshield0`) steered by routes, reusing the UDP AEAD framing (`TUN-HYBRID.md`). Remaining
+   design question: keep inner == outer addresses (current prototype), or add distinct tunnel
+   addresses + an endpoint mapping for overlapping inner prefixes?
 3. **D3** — is the QEMU VM acceptable, or do you want `kalix0`/`meoww` (need login)?
 4. **D4** — paper: measurement-study framing confirmed? The 1266 Mbps figure must be withdrawn.
 5. **Authorship** — confirm the author line with the professor before publishing.

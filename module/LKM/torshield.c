@@ -54,6 +54,9 @@
 #include <net/net_namespace.h>
 #include <net/dst.h>
 #include <net/gso.h>
+#include <net/rtnetlink.h>
+#include <net/route.h>
+#include <net/ip6_route.h>
 #include <linux/netdevice.h>
 #include <linux/if_ether.h>
 
@@ -84,6 +87,7 @@ static LIST_HEAD(peer_list);
 enum ts_mode {
 	TS_MODE_STREAM = 0,
 	TS_MODE_TUNNEL = 1,
+	TS_MODE_HYBRID = 2,     /* TUN netdevice egress + shared UDP decap */
 };
 static int ts_mode = TS_MODE_TUNNEL;
 static unsigned int ts_port = 4789;
@@ -602,6 +606,7 @@ struct ts_tun_hdr {
 
 static atomic64_t st_tun_out, st_tun_in, st_tun_drop, st_tun_replay;
 static atomic64_t st_tun_rx, st_tun_peer;
+static atomic64_t st_dev_out, st_dev_drop;
 
 /* ---- little/big-endian helpers (no arch unaligned header needed) ------- */
 static inline u32 ts_le32(const u8 *p)
@@ -1337,6 +1342,8 @@ static bool ts_is_our_outer(struct sk_buff *skb, bool v6)
  * carried across the tunnel.  Without this, IPv6 neighbour advertisements
  * (src fe80::/10, dst a peer's global address) get encapsulated and are then
  * rejected by the far side as coming from a non-peer. */
+static bool ts_is_tun_dev(const struct net_device *dev);
+
 static bool ts_v6_local_scope(const struct in6_addr *a)
 {
 	static const u8 lo[16] = { 0, 0, 0, 0, 0, 0, 0, 0,
@@ -1381,6 +1388,12 @@ static unsigned int ts_tun_out(struct sk_buff *skb, bool v6)
 		return NF_ACCEPT;
 	}
 	if (!skb_dst(skb))
+		return NF_ACCEPT;
+	/* Hybrid: packets routed into a torshield netdevice are encapsulated by
+	 * that device's ndo_start_xmit, not here.  Everything else keeps the
+	 * transparent netfilter path, so both datapaths can coexist. */
+	if (READ_ONCE(ts_mode) == TS_MODE_HYBRID &&
+	    ts_is_tun_dev(skb_dst(skb)->dev))
 		return NF_ACCEPT;
 
 	spin_lock_irqsave(&cfg_lock, flags);
@@ -1480,6 +1493,197 @@ static unsigned int ts_tun_in(struct sk_buff *skb, bool v6)
 	return ts_tun_decap(skb, v6, uh, l4_len);
 }
 
+/* ---- hybrid TUN-style netdevice ---------------------------------------- */
+/* A route-based L3 tunnel: packets routed into this device are encapsulated
+ * with the same framing/AEAD as the netfilter tunnel.  The outer route is
+ * pinned to the underlay link (IFLA_LINK) so the lookup can never recurse
+ * back into this device.  Receive is shared with tunnel mode: the UDP decap
+ * at LOCAL_IN re-injects the inner packet. */
+#define TS_DEV_MTU 1360         /* + 60 bytes header/tag + <=63 padding < 1500 */
+
+struct ts_priv {
+	int link;                      /* underlay ifindex (IFLA_LINK) */
+};
+
+static netdev_tx_t ts_ndo_start_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+	struct ts_priv *priv = netdev_priv(dev);
+	struct ts_peer *p;
+	struct dst_entry *dst = NULL;
+	struct flowi4 fl4 = {};
+	struct flowi6 fl6 = {};
+	unsigned long flags;
+	u8 key[32];
+	u64 seq = 0;
+	bool v6;
+	int err, reason = 0;
+
+	if (skb->len < sizeof(struct iphdr)) {
+		reason = 1;
+		goto drop;
+	}
+	switch (ip_hdr(skb)->version) {
+	case 4:
+		v6 = false;
+		break;
+	case 6:
+		v6 = true;
+		break;
+	default:
+		reason = 1;
+		goto drop;
+	}
+	if (!priv->link || priv->link == dev->ifindex) {
+		reason = 2;
+		goto drop;
+	}
+	/* Multicast/link-local destinations are link-scoped: never tunnelable.
+	 * This also swallows IPv6 router solicitations that the stack emits on
+	 * a new interface, without counting them as data-path drops. */
+	if (v6 ? ts_v6_local_scope(&ipv6_hdr(skb)->daddr)
+	       : ts_v4_local_scope(ip_hdr(skb)->daddr))
+		goto consume;
+
+	spin_lock_irqsave(&cfg_lock, flags);
+	p = v6 ? peer_find_locked(AF_INET6, &ipv6_hdr(skb)->daddr)
+	       : peer_find_locked(AF_INET, &ip_hdr(skb)->daddr);
+	if (p) {
+		memcpy(key, chacha_key, sizeof(key));
+		seq = (u64)atomic64_inc_return(&p->tx_seq);
+	}
+	spin_unlock_irqrestore(&cfg_lock, flags);
+	if (!seq) {
+		reason = 3;
+		goto drop;
+	}
+
+	if (v6) {
+		fl6.daddr = ipv6_hdr(skb)->daddr;
+		fl6.flowi6_oif = priv->link;
+		fl6.flowi6_proto = IPPROTO_UDP;
+		dst = ip6_route_output(dev_net(dev), NULL, &fl6);
+		if (IS_ERR(dst)) {
+			dst = NULL;
+			reason = 4;
+			goto drop;
+		}
+		if (dst->dev == dev) {  /* misconfiguration: would recurse */
+			dst_release(dst);
+			reason = 5;
+			goto drop;
+		}
+		err = ts_tun_encap_v6(skb, seq, key, dst);
+		dst_release(dst);
+	} else {
+		struct rtable *rt;
+
+		fl4.daddr = ip_hdr(skb)->daddr;
+		fl4.flowi4_oif = priv->link;
+		fl4.flowi4_proto = IPPROTO_UDP;
+		rt = ip_route_output_key(dev_net(dev), &fl4);
+		if (IS_ERR(rt)) {
+			reason = 4;
+			goto drop;
+		}
+		if (rt->dst.dev == dev) {
+			dst_release(&rt->dst);
+			reason = 5;
+			goto drop;
+		}
+		err = ts_tun_encap_v4(skb, seq, key, &rt->dst);
+		dst_release(&rt->dst);
+	}
+	if (!err) {
+		dev->stats.tx_packets++;
+		dev->stats.tx_bytes += skb->len;
+		atomic64_inc(&st_dev_out);
+	} else {
+		dev->stats.tx_errors++;
+		reason = 6;
+		goto drop_after_encap;
+	}
+consume:
+	consume_skb(skb);
+	return NETDEV_TX_OK;
+
+drop_after_encap:
+	atomic64_inc(&st_dev_drop);
+	pr_info_ratelimited("torshield: %s drop reason=%d err=%d len=%u\n",
+			    dev->name, reason, err, skb->len);
+	kfree_skb(skb);
+	return NETDEV_TX_OK;
+
+drop:
+	dev->stats.tx_dropped++;
+	atomic64_inc(&st_dev_drop);
+	pr_info_ratelimited("torshield: %s drop reason=%d len=%u dst=%pI4\n",
+			    dev->name, reason, skb->len,
+			    skb->len >= sizeof(struct iphdr) ?
+			    &ip_hdr(skb)->daddr : NULL);
+	kfree_skb(skb);
+	return NETDEV_TX_OK;
+}
+
+static void ts_ndo_get_stats64(struct net_device *dev,
+			       struct rtnl_link_stats64 *s)
+{
+	netdev_stats_to_stats64(s, &dev->stats);
+}
+
+static const struct net_device_ops ts_netdev_ops = {
+	.ndo_start_xmit = ts_ndo_start_xmit,
+	.ndo_get_stats64 = ts_ndo_get_stats64,
+};
+
+static void ts_dev_setup(struct net_device *dev)
+{
+	dev->netdev_ops = &ts_netdev_ops;
+	dev->type = ARPHRD_NONE;
+	dev->hard_header_len = 0;
+	dev->addr_len = 0;
+	dev->mtu = TS_DEV_MTU;
+	dev->min_mtu = 576;
+	dev->max_mtu = TS_DEV_MTU;
+	dev->flags = IFF_POINTOPOINT | IFF_NOARP;
+	dev->priv_flags |= IFF_NO_QUEUE;
+	dev->needs_free_netdev = true;
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
+static int ts_newlink(struct net_device *dev,
+		      struct rtnl_newlink_params *params,
+		      struct netlink_ext_ack *extack)
+{
+	struct ts_priv *priv = netdev_priv(dev);
+	struct nlattr **tb = params->tb;
+
+	priv->link = tb[IFLA_LINK] ? nla_get_u32(tb[IFLA_LINK]) : 0;
+	return register_netdevice(dev);
+}
+#else
+static int ts_newlink(struct net *net, struct net_device *dev,
+		      struct nlattr *tb[], struct nlattr *data[],
+		      struct netlink_ext_ack *extack)
+{
+	struct ts_priv *priv = netdev_priv(dev);
+
+	priv->link = tb[IFLA_LINK] ? nla_get_u32(tb[IFLA_LINK]) : 0;
+	return register_netdevice(dev);
+}
+#endif
+
+static struct rtnl_link_ops ts_link_ops __read_mostly = {
+	.kind = "torshield",
+	.priv_size = sizeof(struct ts_priv),
+	.setup = ts_dev_setup,
+	.newlink = ts_newlink,
+};
+
+static bool ts_is_tun_dev(const struct net_device *dev)
+{
+	return dev && dev->rtnl_link_ops == &ts_link_ops;
+}
+
 /* ---- netfilter hook trampolines ---------------------------------------- */
 
 static unsigned int hook_v4_out(void *priv, struct sk_buff *skb,
@@ -1487,7 +1691,7 @@ static unsigned int hook_v4_out(void *priv, struct sk_buff *skb,
 {
 	if (!skb || !READ_ONCE(psk_set) || peers_empty())
 		return NF_ACCEPT;
-	if (READ_ONCE(ts_mode) == TS_MODE_TUNNEL)
+	if (READ_ONCE(ts_mode) != TS_MODE_STREAM)
 		return ts_tun_out(skb, false);
 	return process_v4(skb, true);
 }
@@ -1497,7 +1701,7 @@ static unsigned int hook_v4_in(void *priv, struct sk_buff *skb,
 {
 	if (!skb || !READ_ONCE(psk_set) || peers_empty())
 		return NF_ACCEPT;
-	if (READ_ONCE(ts_mode) == TS_MODE_TUNNEL)
+	if (READ_ONCE(ts_mode) != TS_MODE_STREAM)
 		return NF_ACCEPT;       /* tunnel decapsulates at LOCAL_IN */
 	return process_v4(skb, false);
 }
@@ -1507,7 +1711,7 @@ static unsigned int hook_v4_local(void *priv, struct sk_buff *skb,
 {
 	if (!skb || !READ_ONCE(psk_set) || peers_empty())
 		return NF_ACCEPT;
-	if (READ_ONCE(ts_mode) != TS_MODE_TUNNEL)
+	if (READ_ONCE(ts_mode) == TS_MODE_STREAM)
 		return NF_ACCEPT;
 	return ts_tun_in(skb, false);
 }
@@ -1517,7 +1721,7 @@ static unsigned int hook_v6_out(void *priv, struct sk_buff *skb,
 {
 	if (!skb || !READ_ONCE(psk_set) || peers_empty())
 		return NF_ACCEPT;
-	if (READ_ONCE(ts_mode) == TS_MODE_TUNNEL)
+	if (READ_ONCE(ts_mode) != TS_MODE_STREAM)
 		return ts_tun_out(skb, true);
 	return process_v6(skb, true);
 }
@@ -1527,7 +1731,7 @@ static unsigned int hook_v6_in(void *priv, struct sk_buff *skb,
 {
 	if (!skb || !READ_ONCE(psk_set) || peers_empty())
 		return NF_ACCEPT;
-	if (READ_ONCE(ts_mode) == TS_MODE_TUNNEL)
+	if (READ_ONCE(ts_mode) != TS_MODE_STREAM)
 		return NF_ACCEPT;
 	return process_v6(skb, false);
 }
@@ -1537,7 +1741,7 @@ static unsigned int hook_v6_local(void *priv, struct sk_buff *skb,
 {
 	if (!skb || !READ_ONCE(psk_set) || peers_empty())
 		return NF_ACCEPT;
-	if (READ_ONCE(ts_mode) != TS_MODE_TUNNEL)
+	if (READ_ONCE(ts_mode) == TS_MODE_STREAM)
 		return NF_ACCEPT;
 	return ts_tun_in(skb, true);
 }
@@ -1729,11 +1933,22 @@ static const struct proc_ops peers_fops = {
 
 /* ---- /proc/torshield/mode ---------------------------------------------- */
 /* "tunnel" (default): UDP encapsulation with AEAD, padding and replay
- * protection.  "stream": the original length-preserving ChaCha20 transform. */
+ * protection, driven by netfilter.  "hybrid": the same wire format, but
+ * egress is steered by routes into a "torshield" netdevice; ingress still
+ * decapsulates at LOCAL_IN.  "stream": the original length-preserving
+ * ChaCha20 transform. */
 static int mode_show(struct seq_file *m, void *v)
 {
-	seq_printf(m, "%s\n",
-		   READ_ONCE(ts_mode) == TS_MODE_TUNNEL ? "tunnel" : "stream");
+	switch (READ_ONCE(ts_mode)) {
+	case TS_MODE_TUNNEL:
+		seq_puts(m, "tunnel\n");
+		break;
+	case TS_MODE_HYBRID:
+		seq_puts(m, "hybrid\n");
+		break;
+	default:
+		seq_puts(m, "stream\n");
+	}
 	return 0;
 }
 
@@ -1758,6 +1973,8 @@ static ssize_t mode_write(struct file *file, const char __user *ubuf,
 
 	if (strcmp(buf, "tunnel") == 0)
 		WRITE_ONCE(ts_mode, TS_MODE_TUNNEL);
+	else if (strcmp(buf, "hybrid") == 0)
+		WRITE_ONCE(ts_mode, TS_MODE_HYBRID);
 	else if (strcmp(buf, "stream") == 0)
 		WRITE_ONCE(ts_mode, TS_MODE_STREAM);
 	else
@@ -1795,6 +2012,8 @@ static int stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "tun_drop  %lld\n", (long long)atomic64_read(&st_tun_drop));
 	seq_printf(m, "tun_replay %lld\n",
 		   (long long)atomic64_read(&st_tun_replay));
+	seq_printf(m, "dev_out   %lld\n", (long long)atomic64_read(&st_dev_out));
+	seq_printf(m, "dev_drop  %lld\n", (long long)atomic64_read(&st_dev_drop));
 	return 0;
 }
 
@@ -1895,9 +2114,15 @@ static int __init torshield_init(void)
 	if (ret)
 		goto err_proc;
 
+	ret = rtnl_link_register(&ts_link_ops);
+	if (ret)
+		goto err_pernet;
+
 	pr_info("TorShield: loaded (inert until psk and peers are set)\n");
 	return 0;
 
+err_pernet:
+	unregister_pernet_subsys(&ts_net_ops);
 err_proc:
 	proc_remove(proc_dir);
 	return ret;
@@ -1905,6 +2130,7 @@ err_proc:
 
 static void __exit torshield_exit(void)
 {
+	rtnl_link_unregister(&ts_link_ops);
 	unregister_pernet_subsys(&ts_net_ops);
 	proc_remove(proc_dir);
 	peers_clear();
