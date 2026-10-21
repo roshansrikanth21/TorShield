@@ -52,6 +52,10 @@
 #include <net/ipv6.h>
 #include <net/checksum.h>
 #include <net/net_namespace.h>
+#include <net/dst.h>
+#include <net/gso.h>
+#include <linux/netdevice.h>
+#include <linux/if_ether.h>
 
 #define TORSHIELD_PROC_DIR   "torshield"
 
@@ -68,11 +72,26 @@ struct ts_peer {
 		__be32          v4;
 		struct in6_addr v6;
 	} addr;
+	/* tunnel mode state */
+	atomic64_t       tx_seq;                  /* per-peer packet counter    */
+	u64              rx_last;                 /* replay window (under cfg)  */
+	u64              rx_bitmap;
 };
 static LIST_HEAD(peer_list);
 
-static struct nf_hook_ops nfho_v4_out, nfho_v4_in;
-static struct nf_hook_ops nfho_v6_out, nfho_v6_in;
+/* Stream = the original length-preserving transform.
+ * Tunnel = encapsulate in UDP with AEAD, padding, sequence and replay window. */
+enum ts_mode {
+	TS_MODE_STREAM = 0,
+	TS_MODE_TUNNEL = 1,
+};
+static int ts_mode = TS_MODE_TUNNEL;
+static unsigned int ts_port = 4789;
+module_param(ts_port, uint, 0644);
+MODULE_PARM_DESC(ts_port, "UDP port used by tunnel mode (default 4789)");
+
+static struct nf_hook_ops nfho_v4_out, nfho_v4_in, nfho_v4_local;
+static struct nf_hook_ops nfho_v6_out, nfho_v6_in, nfho_v6_local;
 static struct proc_dir_entry *proc_dir;
 
 /* ---- counters (observability; one atomic per event, no locking) -------- */
@@ -177,7 +196,7 @@ static void ts_crypt_tcp_gso(u8 *payload, unsigned int payload_len,
 /* ---- peer matching ----------------------------------------------------- */
 /* Returns true if addr (one end of the packet) is a configured peer.
  * Called from softirq (hook) and process (proc) contexts. */
-static bool peer_match_locked(u8 family, const void *addr)
+static struct ts_peer *peer_find_locked(u8 family, const void *addr)
 {
 	struct ts_peer *p;
 
@@ -186,13 +205,18 @@ static bool peer_match_locked(u8 family, const void *addr)
 			continue;
 		if (family == AF_INET) {
 			if (p->addr.v4 == *(const __be32 *)addr)
-				return true;
+				return p;
 		} else {
 			if (ipv6_addr_equal(&p->addr.v6, (const struct in6_addr *)addr))
-				return true;
+				return p;
 		}
 	}
-	return false;
+	return NULL;
+}
+
+static bool peer_match_locked(u8 family, const void *addr)
+{
+	return peer_find_locked(family, addr) != NULL;
 }
 
 static bool peers_empty(void)
@@ -528,6 +552,934 @@ crypted:
 	return NF_ACCEPT;
 }
 
+/* ======================================================================= *
+ *  UDP tunnel mode
+ * ======================================================================= *
+ *
+ *  Outer packet (IPv4 or IPv6, UDP dport ts_port):
+ *
+ *    [ 16-byte header ][ ciphertext: padded inner IP packet ][ 16-byte tag ]
+ *
+ *  header (also the AEAD associated data):
+ *    'T' 'S', version 1, flags (bit0 = inner is IPv6), 4 reserved,
+ *    8-byte per-peer sequence number (big endian).
+ *
+ *  AEAD is ChaCha20-Poly1305 (RFC 7539), built from the in-kernel ChaCha20
+ *  helper plus Poly1305.  It is deliberately synchronous: the crypto API's
+ *  async algorithms cannot be used from a softirq hook.
+ *
+ *  nonce = 4-byte fold of (src,dst) || 8-byte sequence
+ *
+ *  Sequence numbers are per peer and the receiver keeps a 64-packet sliding
+ *  window, so replays are dropped.  Padding rounds every inner packet up to
+ *  64 bytes so exact sizes are not visible.
+ */
+
+#define TS_TUN_MAGIC0    'T'
+#define TS_TUN_MAGIC1    'S'
+#define TS_TUN_VERSION   1
+#define TS_TUN_HDR_LEN   16
+#define TS_TUN_TAG_LEN   16
+#define TS_TUN_PAD       64
+#define TS_TUN_MARK      0x5453
+#define TS_TUN_MSS4      1360
+#define TS_TUN_MSS6      1340
+/* min payload: header + one cipher block + tag */
+#define TS_TUN_MIN_L4    (8 + TS_TUN_HDR_LEN + 16 + TS_TUN_TAG_LEN)
+
+/* Not exported by the kernel headers on every release. */
+#ifndef TCPOPT_MAXSEG
+#define TCPOPT_MAXSEG    2
+#endif
+
+struct ts_tun_hdr {
+	u8  magic[2];
+	u8  version;
+	u8  flags;
+	u32 reserved;
+	u64 seq;                        /* big endian on the wire */
+} __packed;
+
+static atomic64_t st_tun_out, st_tun_in, st_tun_drop, st_tun_replay;
+static atomic64_t st_tun_rx, st_tun_peer;
+
+/* ---- little/big-endian helpers (no arch unaligned header needed) ------- */
+static inline u32 ts_le32(const u8 *p)
+{
+	u32 v;
+
+	memcpy(&v, p, 4);
+	return le32_to_cpu(v);
+}
+
+static inline void ts_put_le32(u8 *p, u32 v)
+{
+	v = cpu_to_le32(v);
+	memcpy(p, &v, 4);
+}
+
+static inline void ts_put_le64(u8 *p, u64 v)
+{
+	v = cpu_to_le64(v);
+	memcpy(p, &v, 8);
+}
+
+static inline u64 ts_be64(const u8 *p)
+{
+	u64 v;
+
+	memcpy(&v, p, 8);
+	return be64_to_cpu(v);
+}
+
+static inline void ts_put_be64(u8 *p, u64 v)
+{
+	v = cpu_to_be64(v);
+	memcpy(p, &v, 8);
+}
+
+/* ---- Poly1305 (32-bit limbs, public-domain "donna" construction) ------- */
+struct ts_poly1305 {
+	u32 r[5];
+	u32 h[5];
+	u32 pad[4];
+	u8  buf[16];
+	size_t leftover;
+};
+
+static void ts_poly1305_init(struct ts_poly1305 *st, const u8 key[32])
+{
+	u32 t0 = ts_le32(key + 0);
+	u32 t1 = ts_le32(key + 4);
+	u32 t2 = ts_le32(key + 8);
+	u32 t3 = ts_le32(key + 12);
+
+	st->r[0] = t0 & 0x3ffffff;
+	st->r[1] = ((t0 >> 26) | (t1 << 6)) & 0x3ffff03;
+	st->r[2] = ((t1 >> 20) | (t2 << 12)) & 0x3ffc0ff;
+	st->r[3] = ((t2 >> 14) | (t3 << 18)) & 0x3f03fff;
+	st->r[4] = (t3 >> 8) & 0x00fffff;
+
+	memset(st->h, 0, sizeof(st->h));
+	st->pad[0] = ts_le32(key + 16);
+	st->pad[1] = ts_le32(key + 20);
+	st->pad[2] = ts_le32(key + 24);
+	st->pad[3] = ts_le32(key + 28);
+	st->leftover = 0;
+}
+
+static void ts_poly1305_blocks(struct ts_poly1305 *st, const u8 *m,
+			       size_t bytes, u32 hibit)
+{
+	u32 h0 = st->h[0], h1 = st->h[1], h2 = st->h[2];
+	u32 h3 = st->h[3], h4 = st->h[4];
+	const u32 r0 = st->r[0], r1 = st->r[1], r2 = st->r[2];
+	const u32 r3 = st->r[3], r4 = st->r[4];
+	const u32 s1 = r1 * 5, s2 = r2 * 5, s3 = r3 * 5, s4 = r4 * 5;
+
+	while (bytes >= 16) {
+		u64 d0, d1, d2, d3, d4;
+
+		h0 += ts_le32(m + 0) & 0x3ffffff;
+		h1 += (ts_le32(m + 3) >> 2) & 0x3ffffff;
+		h2 += (ts_le32(m + 6) >> 4) & 0x3ffffff;
+		h3 += (ts_le32(m + 9) >> 6) & 0x3ffffff;
+		h4 += (ts_le32(m + 12) >> 8) | hibit;
+
+		d0 = (u64)h0 * r0 + (u64)h1 * s4 + (u64)h2 * s3 +
+		     (u64)h3 * s2 + (u64)h4 * s1;
+		d1 = (u64)h0 * r1 + (u64)h1 * r0 + (u64)h2 * s4 +
+		     (u64)h3 * s3 + (u64)h4 * s2;
+		d2 = (u64)h0 * r2 + (u64)h1 * r1 + (u64)h2 * r0 +
+		     (u64)h3 * s4 + (u64)h4 * s3;
+		d3 = (u64)h0 * r3 + (u64)h1 * r2 + (u64)h2 * r1 +
+		     (u64)h3 * r0 + (u64)h4 * s4;
+		d4 = (u64)h0 * r4 + (u64)h1 * r3 + (u64)h2 * r2 +
+		     (u64)h3 * r1 + (u64)h4 * r0;
+
+		h0 = (u32)d0 & 0x3ffffff;
+		d1 += d0 >> 26;
+		h1 = (u32)d1 & 0x3ffffff;
+		d2 += d1 >> 26;
+		h2 = (u32)d2 & 0x3ffffff;
+		d3 += d2 >> 26;
+		h3 = (u32)d3 & 0x3ffffff;
+		d4 += d3 >> 26;
+		h4 = (u32)d4 & 0x3ffffff;
+		h0 += (u32)(d4 >> 26) * 5;
+		h1 += h0 >> 26;
+		h0 &= 0x3ffffff;
+
+		m += 16;
+		bytes -= 16;
+	}
+	st->h[0] = h0;
+	st->h[1] = h1;
+	st->h[2] = h2;
+	st->h[3] = h3;
+	st->h[4] = h4;
+}
+
+static void ts_poly1305_update(struct ts_poly1305 *st, const u8 *m, size_t bytes)
+{
+	if (st->leftover) {
+		size_t want = 16 - st->leftover;
+
+		if (want > bytes)
+			want = bytes;
+		memcpy(st->buf + st->leftover, m, want);
+		st->leftover += want;
+		m += want;
+		bytes -= want;
+		if (st->leftover < 16)
+			return;
+		ts_poly1305_blocks(st, st->buf, 16, 1 << 24);
+		st->leftover = 0;
+	}
+	if (bytes >= 16) {
+		size_t want = bytes & ~(size_t)15;
+
+		ts_poly1305_blocks(st, m, want, 1 << 24);
+		m += want;
+		bytes -= want;
+	}
+	if (bytes) {
+		memcpy(st->buf, m, bytes);
+		st->leftover = bytes;
+	}
+}
+
+static void ts_poly1305_final(struct ts_poly1305 *st, u8 mac[16])
+{
+	u32 h0, h1, h2, h3, h4, g0, g1, g2, g3, g4, c;
+	u32 mask;
+	u64 f;
+
+	if (st->leftover) {
+		size_t i = st->leftover;
+
+		st->buf[i++] = 1;
+		while (i < 16)
+			st->buf[i++] = 0;
+		ts_poly1305_blocks(st, st->buf, 16, 0);
+	}
+
+	h0 = st->h[0];
+	h1 = st->h[1];
+	h2 = st->h[2];
+	h3 = st->h[3];
+	h4 = st->h[4];
+
+	c = h1 >> 26; h1 &= 0x3ffffff; h2 += c;
+	c = h2 >> 26; h2 &= 0x3ffffff; h3 += c;
+	c = h3 >> 26; h3 &= 0x3ffffff; h4 += c;
+	c = h4 >> 26; h4 &= 0x3ffffff; h0 += c * 5;
+	c = h0 >> 26; h0 &= 0x3ffffff; h1 += c;
+
+	g0 = h0 + 5;
+	c = g0 >> 26; g0 &= 0x3ffffff;
+	g1 = h1 + c;
+	c = g1 >> 26; g1 &= 0x3ffffff;
+	g2 = h2 + c;
+	c = g2 >> 26; g2 &= 0x3ffffff;
+	g3 = h3 + c;
+	c = g3 >> 26; g3 &= 0x3ffffff;
+	g4 = h4 + c - (1 << 26);
+
+	mask = (g4 >> 31) - 1;
+	h0 = (h0 & ~mask) | (g0 & mask);
+	h1 = (h1 & ~mask) | (g1 & mask);
+	h2 = (h2 & ~mask) | (g2 & mask);
+	h3 = (h3 & ~mask) | (g3 & mask);
+
+	h0 = (h0 | (h1 << 26)) & 0xffffffff;
+	h1 = ((h1 >> 6) | (h2 << 20)) & 0xffffffff;
+	h2 = ((h2 >> 12) | (h3 << 14)) & 0xffffffff;
+	h3 = ((h3 >> 18) | (h4 << 8)) & 0xffffffff;
+
+	f = (u64)h0 + st->pad[0];
+	h0 = (u32)f;
+	f = (u64)h1 + st->pad[1] + (f >> 32);
+	h1 = (u32)f;
+	f = (u64)h2 + st->pad[2] + (f >> 32);
+	h2 = (u32)f;
+	f = (u64)h3 + st->pad[3] + (f >> 32);
+	h3 = (u32)f;
+
+	ts_put_le32(mac + 0, h0);
+	ts_put_le32(mac + 4, h1);
+	ts_put_le32(mac + 8, h2);
+	ts_put_le32(mac + 12, h3);
+}
+
+/* ---- ChaCha20 with an explicit IV (counter || nonce) ------------------- */
+static void ts_chacha_iv(const u8 key[32], u8 iv[16], u8 *data, unsigned int len)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+	struct chacha_state state;
+
+	chacha_init(&state, (const u32 *)key, iv);
+	chacha_crypt(&state, data, data, len, 20);
+	memzero_explicit(&state, sizeof(state));
+#else
+	u32 state[CHACHA_STATE_WORDS];
+
+	chacha_init(state, (const u32 *)key, iv);
+	chacha_crypt(state, data, data, len, 20);
+	memzero_explicit(state, sizeof(state));
+#endif
+}
+
+static void ts_aead_tag(const u8 key[32], const u8 nonce[12],
+			const u8 *aad, unsigned int aad_len,
+			const u8 *buf, unsigned int len, u8 tag[16])
+{
+	static const u8 zeros[16] = { 0 };
+	struct ts_poly1305 st;
+	u8 polykey[32];
+	u8 iv[16];
+	u8 lens[16];
+	unsigned int pad;
+
+	memset(iv, 0, sizeof(iv));
+	memcpy(iv + 4, nonce, 12);
+
+	/* RFC 7539: the Poly1305 key is the first 32 bytes of block 0. */
+	memset(polykey, 0, sizeof(polykey));
+	ts_chacha_iv(key, iv, polykey, sizeof(polykey));
+
+	ts_poly1305_init(&st, polykey);
+	ts_poly1305_update(&st, aad, aad_len);
+	pad = (16 - (aad_len & 15)) & 15;
+	if (pad)
+		ts_poly1305_update(&st, zeros, pad);
+	ts_poly1305_update(&st, buf, len);
+	pad = (16 - (len & 15)) & 15;
+	if (pad)
+		ts_poly1305_update(&st, zeros, pad);
+	ts_put_le64(lens, aad_len);
+	ts_put_le64(lens + 8, len);
+	ts_poly1305_update(&st, lens, 16);
+	ts_poly1305_final(&st, tag);
+
+	memzero_explicit(polykey, sizeof(polykey));
+	memzero_explicit(&st, sizeof(st));
+}
+
+static void ts_aead_seal(const u8 key[32], const u8 nonce[12],
+			 const u8 *aad, unsigned int aad_len,
+			 u8 *buf, unsigned int len, u8 tag[16])
+{
+	u8 iv[16];
+
+	/* Encrypt first: RFC 7539 authenticates the ciphertext. */
+	memset(iv, 0, sizeof(iv));
+	memcpy(iv + 4, nonce, 12);
+	iv[0] = 1;                      /* payload starts at block counter 1 */
+	ts_chacha_iv(key, iv, buf, len);
+
+	ts_aead_tag(key, nonce, aad, aad_len, buf, len, tag);
+}
+
+static bool ts_aead_open(const u8 key[32], const u8 nonce[12],
+			 const u8 *aad, unsigned int aad_len,
+			 u8 *buf, unsigned int len, const u8 tag[16])
+{
+	u8 calc[16];
+	u8 iv[16];
+	u8 d = 0;
+	int i;
+
+	ts_aead_tag(key, nonce, aad, aad_len, buf, len, calc);
+	for (i = 0; i < 16; i++)
+		d |= calc[i] ^ tag[i];
+	if (d)
+		return false;
+
+	memset(iv, 0, sizeof(iv));
+	memcpy(iv + 4, nonce, 12);
+	iv[0] = 1;
+	ts_chacha_iv(key, iv, buf, len);
+	return true;
+}
+
+/* ---- replay window ----------------------------------------------------- */
+static bool ts_replay_ok(struct ts_peer *p, u64 seq)
+{
+	if (seq == 0)
+		return false;
+
+	if (seq > p->rx_last) {
+		u64 diff = seq - p->rx_last;
+
+		if (diff >= 64)
+			p->rx_bitmap = 0;
+		else
+			p->rx_bitmap <<= diff;
+		p->rx_bitmap |= 1;
+		p->rx_last = seq;
+		return true;
+	}
+
+	{
+		u64 diff = p->rx_last - seq;
+
+		if (diff >= 64)
+			return false;
+		if (p->rx_bitmap & (1ULL << diff))
+			return false;
+		p->rx_bitmap |= 1ULL << diff;
+		return true;
+	}
+}
+
+static void ts_tun_nonce(__be32 fold, u64 seq, u8 nonce[12])
+{
+	memcpy(nonce, &fold, 4);
+	ts_put_be64(nonce + 4, seq);
+}
+
+/* ---- TCP MSS clamping -------------------------------------------------- */
+/* The outer header + tag + worst-case padding must fit in one MTU, otherwise
+ * every TCP segment would be fragmented by the outer IP layer. */
+static bool ts_clamp_mss(struct tcphdr *th, unsigned int limit)
+{
+	u8 *opt;
+	unsigned int olen;
+
+	if (!th->syn || th->doff < 5)
+		return false;
+	olen = th->doff * 4 - sizeof(*th);
+	opt = (u8 *)(th + 1);
+
+	while (olen >= 4) {
+		u16 mss;
+
+		if (opt[0] == TCPOPT_EOL)
+			break;
+		if (opt[0] == TCPOPT_NOP) {
+			opt++;
+			olen--;
+			continue;
+		}
+		if (opt[1] < 2 || opt[1] > olen)
+			break;
+		if (opt[0] == TCPOPT_MAXSEG && opt[1] == 4) {
+			memcpy(&mss, opt + 2, 2);
+			if (ntohs(mss) > limit) {
+				mss = htons(limit);
+				memcpy(opt + 2, &mss, 2);
+				return true;
+			}
+			return false;
+		}
+		olen -= opt[1];
+		opt += opt[1];
+	}
+	return false;
+}
+
+static u64 ts_next_seq(u8 family, const void *addr)
+{
+	struct ts_peer *p;
+	unsigned long flags;
+	u64 seq = 0;
+
+	spin_lock_irqsave(&cfg_lock, flags);
+	p = peer_find_locked(family, addr);
+	if (p)
+		seq = (u64)atomic64_inc_return(&p->tx_seq);
+	spin_unlock_irqrestore(&cfg_lock, flags);
+	return seq;
+}
+
+/* ---- encapsulation ----------------------------------------------------- */
+static int ts_tun_encap_v4(struct sk_buff *skb, u64 seq, const u8 key[32],
+			   struct dst_entry *hold)
+{
+	struct iphdr *iph, *oiph;
+	struct udphdr *uh;
+	struct ts_tun_hdr *th;
+	struct sk_buff *n;
+	u8 tag[16], nonce[12];
+	u8 *payload;
+	unsigned int ihl, inner_len, padded, total, l4_len;
+	__be32 fold;
+
+	if (skb_linearize(skb) < 0)
+		return -ENOMEM;
+	iph = ip_hdr(skb);
+	if (iph->ihl < 5)
+		return -EINVAL;
+	ihl = iph->ihl * 4;
+	if (ntohs(iph->tot_len) < ihl || ntohs(iph->tot_len) > skb->len)
+		return -EINVAL;
+	inner_len = ntohs(iph->tot_len);
+	l4_len = inner_len - ihl;
+
+	if (iph->protocol == IPPROTO_TCP && l4_len >= sizeof(struct tcphdr)) {
+		struct tcphdr *th = (struct tcphdr *)((u8 *)iph + ihl);
+
+		if (th->doff >= 5 &&
+		    ts_clamp_mss(th, TS_TUN_MSS4) &&
+		    skb->ip_summed != CHECKSUM_PARTIAL)
+			fixup_csum_v4(skb, iph, th, l4_len, true);
+	}
+
+	/* The copied inner packet must carry a finished checksum. */
+	if (skb->ip_summed == CHECKSUM_PARTIAL && skb_checksum_help(skb))
+		return -EINVAL;
+	iph = ip_hdr(skb);
+
+	padded = round_up(inner_len, TS_TUN_PAD);
+	total = sizeof(*oiph) + sizeof(*uh) + TS_TUN_HDR_LEN + padded +
+		TS_TUN_TAG_LEN;
+	if (total > 65535)
+		return -EMSGSIZE;
+
+	n = alloc_skb(total + 128, GFP_ATOMIC);
+	if (!n)
+		return -ENOMEM;
+	skb_reserve(n, 128);
+	oiph = skb_put(n, sizeof(*oiph));
+	uh = skb_put(n, sizeof(*uh));
+	th = skb_put(n, TS_TUN_HDR_LEN);
+	payload = skb_put(n, padded);
+	skb_reset_network_header(n);
+	skb_set_transport_header(n, sizeof(*oiph));
+
+	memcpy(payload, iph, inner_len);
+	memset(payload + inner_len, 0, padded - inner_len);
+
+	memset(th, 0, TS_TUN_HDR_LEN);
+	th->magic[0] = TS_TUN_MAGIC0;
+	th->magic[1] = TS_TUN_MAGIC1;
+	th->version = TS_TUN_VERSION;
+	th->flags = 0;
+	ts_put_be64((u8 *)th + 8, seq);
+
+	fold = iph->saddr ^ iph->daddr;
+	ts_tun_nonce(fold, seq, nonce);
+	ts_aead_seal(key, nonce, (u8 *)th, TS_TUN_HDR_LEN, payload, padded, tag);
+	memcpy(skb_put(n, TS_TUN_TAG_LEN), tag, TS_TUN_TAG_LEN);
+
+	memset(oiph, 0, sizeof(*oiph));
+	oiph->version = 4;
+	oiph->ihl = 5;
+	oiph->tos = 0;
+	oiph->tot_len = htons(total);
+	oiph->ttl = 64;
+	oiph->protocol = IPPROTO_UDP;
+	oiph->saddr = iph->saddr;
+	oiph->daddr = iph->daddr;
+	ip_send_check(oiph);
+
+	uh->source = htons(ts_port);
+	uh->dest = htons(ts_port);
+	uh->len = htons(TS_TUN_HDR_LEN + padded + TS_TUN_TAG_LEN +
+			sizeof(*uh));
+	uh->check = 0;                  /* legal for IPv4 */
+
+	n->dev = skb->dev;
+	n->protocol = htons(ETH_P_IP);
+	skb_dst_set(n, dst_clone(hold ? hold : skb_dst(skb)));
+	ip_local_out(dev_net(n->dev), NULL, n);
+	return 0;
+}
+
+static int ts_tun_encap_v6(struct sk_buff *skb, u64 seq, const u8 key[32],
+			   struct dst_entry *hold)
+{
+	struct ipv6hdr *ip6h, *o6;
+	struct udphdr *uh;
+	struct ts_tun_hdr *th;
+	struct sk_buff *n;
+	u8 tag[16], nonce[12];
+	u8 *payload;
+	unsigned int inner_len, padded, total, l4_len;
+	__be32 fold;
+
+	if (skb_linearize(skb) < 0)
+		return -ENOMEM;
+	ip6h = ipv6_hdr(skb);
+	inner_len = sizeof(*ip6h) + ntohs(ip6h->payload_len);
+	if (inner_len > skb->len)
+		return -EINVAL;
+	l4_len = ntohs(ip6h->payload_len);
+
+	if (ip6h->nexthdr == IPPROTO_TCP && l4_len >= sizeof(struct tcphdr)) {
+		struct tcphdr *th = (struct tcphdr *)(ip6h + 1);
+
+		if (th->doff >= 5 &&
+		    ts_clamp_mss(th, TS_TUN_MSS6) &&
+		    skb->ip_summed != CHECKSUM_PARTIAL)
+			fixup_csum_v6(skb, ip6h, th, l4_len, true);
+	}
+
+	if (skb->ip_summed == CHECKSUM_PARTIAL && skb_checksum_help(skb))
+		return -EINVAL;
+	ip6h = ipv6_hdr(skb);
+
+	padded = round_up(inner_len, TS_TUN_PAD);
+	total = sizeof(*o6) + sizeof(*uh) + TS_TUN_HDR_LEN + padded +
+		TS_TUN_TAG_LEN;
+	if (total > 65535)
+		return -EMSGSIZE;
+
+	n = alloc_skb(total + 128, GFP_ATOMIC);
+	if (!n)
+		return -ENOMEM;
+	skb_reserve(n, 128);
+	o6 = skb_put(n, sizeof(*o6));
+	uh = skb_put(n, sizeof(*uh));
+	th = skb_put(n, TS_TUN_HDR_LEN);
+	payload = skb_put(n, padded);
+	skb_reset_network_header(n);
+	skb_set_transport_header(n, sizeof(*o6));
+
+	memcpy(payload, ip6h, inner_len);
+	memset(payload + inner_len, 0, padded - inner_len);
+
+	memset(th, 0, TS_TUN_HDR_LEN);
+	th->magic[0] = TS_TUN_MAGIC0;
+	th->magic[1] = TS_TUN_MAGIC1;
+	th->version = TS_TUN_VERSION;
+	th->flags = 1;                  /* inner is IPv6 */
+	ts_put_be64((u8 *)th + 8, seq);
+
+	fold = ip6h->saddr.s6_addr32[0] ^ ip6h->saddr.s6_addr32[1] ^
+	       ip6h->saddr.s6_addr32[2] ^ ip6h->saddr.s6_addr32[3] ^
+	       ip6h->daddr.s6_addr32[0] ^ ip6h->daddr.s6_addr32[1] ^
+	       ip6h->daddr.s6_addr32[2] ^ ip6h->daddr.s6_addr32[3];
+	ts_tun_nonce(fold, seq, nonce);
+	ts_aead_seal(key, nonce, (u8 *)th, TS_TUN_HDR_LEN, payload, padded, tag);
+	memcpy(skb_put(n, TS_TUN_TAG_LEN), tag, TS_TUN_TAG_LEN);
+
+	memset(o6, 0, sizeof(*o6));
+	o6->version = 6;
+	o6->nexthdr = IPPROTO_UDP;
+	o6->hop_limit = 64;
+	o6->saddr = ip6h->saddr;
+	o6->daddr = ip6h->daddr;
+
+	uh->source = htons(ts_port);
+	uh->dest = htons(ts_port);
+	uh->len = htons(TS_TUN_HDR_LEN + padded + TS_TUN_TAG_LEN +
+			sizeof(*uh));
+	uh->check = 0;
+	n->ip_summed = CHECKSUM_PARTIAL;        /* mandatory for IPv6 UDP */
+	n->csum_start = skb_transport_offset(n);
+	n->csum_offset = offsetof(struct udphdr, check);
+
+	n->dev = skb->dev;
+	n->protocol = htons(ETH_P_IPV6);
+	skb_dst_set(n, dst_clone(hold ? hold : skb_dst(skb)));
+	ip6_local_out(dev_net(n->dev), NULL, n);
+	return 0;
+}
+
+/* ---- decapsulation ----------------------------------------------------- */
+static void ts_note_nonpeer(struct sk_buff *skb, bool v6, u64 seq)
+{
+	atomic64_inc(&st_tun_peer);
+	if (v6)
+		pr_info_ratelimited("torshield: non-peer tunnel pkt src=%pI6 dst=%pI6 dev=%s seq=%llu\n",
+				    &ipv6_hdr(skb)->saddr, &ipv6_hdr(skb)->daddr,
+				    skb->dev ? skb->dev->name : "?", seq);
+	else
+		pr_info_ratelimited("torshield: non-peer tunnel pkt src=%pI4 dst=%pI4 dev=%s seq=%llu\n",
+				    &ip_hdr(skb)->saddr, &ip_hdr(skb)->daddr,
+				    skb->dev ? skb->dev->name : "?", seq);
+}
+
+static unsigned int ts_tun_decap(struct sk_buff *skb, bool outer_v6,
+				 struct udphdr *uh, unsigned int l4_len)
+{
+	struct ts_tun_hdr *th;
+	struct ts_peer *p;
+	struct sk_buff *n;
+	u8 key[32], nonce[12];
+	unsigned int ct_len, inner_len;
+	unsigned long flags;
+	const u8 *ct;
+	const u8 *tag;
+	u64 seq;
+	bool v6;
+	__be32 fold;
+
+	if (l4_len < TS_TUN_MIN_L4)
+		goto bad;
+	th = (struct ts_tun_hdr *)((u8 *)uh + sizeof(*uh));
+	if (th->magic[0] != TS_TUN_MAGIC0 || th->magic[1] != TS_TUN_MAGIC1 ||
+	    th->version != TS_TUN_VERSION)
+		return NF_ACCEPT;       /* not ours */
+
+	atomic64_inc(&st_tun_rx);
+
+	ct_len = l4_len - sizeof(*uh) - TS_TUN_HDR_LEN - TS_TUN_TAG_LEN;
+	if (ct_len < 16 || (ct_len & 15))
+		goto bad;
+	ct = (u8 *)th + TS_TUN_HDR_LEN;
+	tag = ct + ct_len;
+	seq = ts_be64((u8 *)th + 8);
+
+	spin_lock_irqsave(&cfg_lock, flags);
+	p = outer_v6 ? peer_find_locked(AF_INET6, &ipv6_hdr(skb)->saddr)
+		     : peer_find_locked(AF_INET, &ip_hdr(skb)->saddr);
+	if (!p) {
+		spin_unlock_irqrestore(&cfg_lock, flags);
+		ts_note_nonpeer(skb, outer_v6, seq);
+		return NF_DROP;         /* tunnel framing from an unknown peer */
+	}
+	memcpy(key, chacha_key, sizeof(key));
+	spin_unlock_irqrestore(&cfg_lock, flags);
+
+	fold = (th->flags & 1) ?
+	       (ipv6_hdr(skb)->saddr.s6_addr32[0] ^
+		ipv6_hdr(skb)->saddr.s6_addr32[1] ^
+		ipv6_hdr(skb)->saddr.s6_addr32[2] ^
+		ipv6_hdr(skb)->saddr.s6_addr32[3] ^
+		ipv6_hdr(skb)->daddr.s6_addr32[0] ^
+		ipv6_hdr(skb)->daddr.s6_addr32[1] ^
+		ipv6_hdr(skb)->daddr.s6_addr32[2] ^
+		ipv6_hdr(skb)->daddr.s6_addr32[3])
+	      : (ip_hdr(skb)->saddr ^ ip_hdr(skb)->daddr);
+
+	/* Authenticate before touching the replay window: an off-path packet
+	 * must not be able to advance it. */
+	ts_tun_nonce(fold, seq, nonce);
+	if (!ts_aead_open(key, nonce, (u8 *)th, TS_TUN_HDR_LEN,
+			  (u8 *)ct, ct_len, tag)) {
+		atomic64_inc(&st_tun_drop);
+		return NF_DROP;
+	}
+
+	spin_lock_irqsave(&cfg_lock, flags);
+	p = outer_v6 ? peer_find_locked(AF_INET6, &ipv6_hdr(skb)->saddr)
+		     : peer_find_locked(AF_INET, &ip_hdr(skb)->saddr);
+	if (!p) {
+		spin_unlock_irqrestore(&cfg_lock, flags);
+		ts_note_nonpeer(skb, outer_v6, seq);
+		return NF_DROP;
+	}
+	if (!ts_replay_ok(p, seq)) {
+		spin_unlock_irqrestore(&cfg_lock, flags);
+		atomic64_inc(&st_tun_replay);
+		return NF_DROP;
+	}
+	spin_unlock_irqrestore(&cfg_lock, flags);
+
+	v6 = (th->flags & 1) != 0;
+	if (v6) {
+		struct ipv6hdr *in = (struct ipv6hdr *)ct;
+
+		if (ct_len < sizeof(*in) || in->version != 6)
+			goto bad;
+		inner_len = sizeof(*in) + ntohs(in->payload_len);
+	} else {
+		struct iphdr *in = (struct iphdr *)ct;
+
+		if (ct_len < sizeof(*in) || in->version != 4 || in->ihl < 5)
+			goto bad;
+		inner_len = ntohs(in->tot_len);
+		if (inner_len < in->ihl * 4)
+			goto bad;
+	}
+	if (inner_len > ct_len)
+		goto bad;
+
+	n = alloc_skb(inner_len + 128, GFP_ATOMIC);
+	if (!n)
+		goto bad;
+	skb_reserve(n, 128);
+	memcpy(skb_put(n, inner_len), ct, inner_len);
+	skb_reset_network_header(n);
+	skb_reset_mac_header(n);        /* no L2 header: keep taps consistent */
+	n->dev = skb->dev;
+	n->protocol = htons(v6 ? ETH_P_IPV6 : ETH_P_IP);
+	n->ip_summed = CHECKSUM_UNNECESSARY;
+	n->mark = TS_TUN_MARK;
+	n->pkt_type = PACKET_HOST;
+
+	netif_rx(n);
+	kfree_skb(skb);
+	atomic64_inc(&st_tun_in);
+	return NF_STOLEN;
+
+bad:
+	atomic64_inc(&st_tun_drop);
+	return NF_DROP;
+}
+
+/* ---- hook bodies ------------------------------------------------------- */
+static bool ts_is_our_outer(struct sk_buff *skb, bool v6)
+{
+	if (v6) {
+		struct ipv6hdr *ip6h = ipv6_hdr(skb);
+		struct udphdr *uh;
+
+		if (ip6h->nexthdr != IPPROTO_UDP)
+			return false;
+		uh = (struct udphdr *)(ip6h + 1);
+		return ntohs(uh->dest) == ts_port;
+	} else {
+		struct iphdr *iph = ip_hdr(skb);
+		struct udphdr *uh;
+
+		if (iph->protocol != IPPROTO_UDP || iph->ihl < 5)
+			return false;
+		uh = (struct udphdr *)((u8 *)iph + iph->ihl * 4);
+		return ntohs(uh->dest) == ts_port;
+	}
+}
+
+/* Link-local / loopback traffic is scoped to a single link and must never be
+ * carried across the tunnel.  Without this, IPv6 neighbour advertisements
+ * (src fe80::/10, dst a peer's global address) get encapsulated and are then
+ * rejected by the far side as coming from a non-peer. */
+static bool ts_v6_local_scope(const struct in6_addr *a)
+{
+	static const u8 lo[16] = { 0, 0, 0, 0, 0, 0, 0, 0,
+				   0, 0, 0, 0, 0, 0, 0, 1 };
+	const u8 *b = a->s6_addr;
+
+	if (b[0] == 0xff)                               /* multicast */
+		return true;
+	if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80)      /* fe80::/10 */
+		return true;
+	if (b[0] == 0xfe && (b[1] & 0xc0) == 0xc0)      /* fec0::/10 */
+		return true;
+	return !memcmp(b, lo, sizeof(lo));
+}
+
+static bool ts_v4_local_scope(__be32 a)
+{
+	u32 h = ntohl(a);
+
+	return (h & 0xffff0000U) == 0xa9fe0000U ||      /* 169.254/16 */
+	       (h & 0xff000000U) == 0x7f000000U;        /* 127/8 */
+}
+
+static unsigned int ts_tun_out(struct sk_buff *skb, bool v6)
+{
+	struct sk_buff *segs, *seg;
+	struct dst_entry *hold;
+	unsigned long flags;
+	struct ts_peer *p;
+	u8 key[32];
+	u64 seq;
+	int err;
+
+	if (skb->mark == TS_TUN_MARK)
+		return NF_ACCEPT;
+	if (ts_is_our_outer(skb, v6))
+		return NF_ACCEPT;
+	if (v6) {
+		if (ts_v6_local_scope(&ipv6_hdr(skb)->saddr))
+			return NF_ACCEPT;
+	} else if (ts_v4_local_scope(ip_hdr(skb)->saddr)) {
+		return NF_ACCEPT;
+	}
+	if (!skb_dst(skb))
+		return NF_ACCEPT;
+
+	spin_lock_irqsave(&cfg_lock, flags);
+	p = v6 ? peer_find_locked(AF_INET6, &ipv6_hdr(skb)->daddr)
+	       : peer_find_locked(AF_INET, &ip_hdr(skb)->daddr);
+	if (p)
+		memcpy(key, chacha_key, sizeof(key));
+	spin_unlock_irqrestore(&cfg_lock, flags);
+	if (!p)
+		return NF_ACCEPT;
+
+	if (!skb_is_gso(skb)) {
+		seq = ts_next_seq(v6 ? AF_INET6 : AF_INET,
+				  v6 ? (void *)&ipv6_hdr(skb)->daddr
+				     : (void *)&ip_hdr(skb)->daddr);
+		if (!seq)
+			return NF_ACCEPT;
+		err = v6 ? ts_tun_encap_v6(skb, seq, key, NULL)
+			 : ts_tun_encap_v4(skb, seq, key, NULL);
+		if (err) {
+			atomic64_inc(&st_tun_drop);
+			return NF_DROP;
+		}
+		consume_skb(skb);
+		atomic64_inc(&st_tun_out);
+		return NF_STOLEN;
+	}
+
+	hold = dst_clone(skb_dst(skb));
+	segs = skb_gso_segment(skb, 0);
+	if (IS_ERR(segs)) {
+		dst_release(hold);
+		atomic64_inc(&st_tun_drop);
+		return NF_DROP;
+	}
+	consume_skb(skb);
+	atomic64_inc(&st_tun_out);
+
+	for (seg = segs; seg; ) {
+		struct sk_buff *next = seg->next;
+
+		seg->next = NULL;
+		seq = ts_next_seq(v6 ? AF_INET6 : AF_INET,
+				  v6 ? (void *)&ipv6_hdr(seg)->daddr
+				     : (void *)&ip_hdr(seg)->daddr);
+		if (!seq) {
+			kfree_skb(seg);
+		} else {
+			err = v6 ? ts_tun_encap_v6(seg, seq, key, hold)
+				 : ts_tun_encap_v4(seg, seq, key, hold);
+			if (err) {
+				atomic64_inc(&st_tun_drop);
+				kfree_skb(seg);
+			}
+		}
+		seg = next;
+	}
+	dst_release(hold);
+	return NF_STOLEN;
+}
+
+static unsigned int ts_tun_in(struct sk_buff *skb, bool v6)
+{
+	struct udphdr *uh;
+	unsigned int ihl, l4_len;
+
+	if (skb->mark == TS_TUN_MARK)
+		return NF_ACCEPT;
+
+	if (v6) {
+		struct ipv6hdr *ip6h = ipv6_hdr(skb);
+
+		if (ip6h->nexthdr != IPPROTO_UDP) {
+			/* extension headers are not parsed here */
+			return NF_ACCEPT;
+		}
+		ihl = sizeof(*ip6h);
+		l4_len = ntohs(ip6h->payload_len);
+		if (l4_len < sizeof(*uh))
+			return NF_ACCEPT;
+		uh = (struct udphdr *)(ip6h + 1);
+	} else {
+		struct iphdr *iph = ip_hdr(skb);
+
+		if (iph->protocol != IPPROTO_UDP || iph->ihl < 5)
+			return NF_ACCEPT;
+		ihl = iph->ihl * 4;
+		if (ntohs(iph->tot_len) < ihl + sizeof(*uh))
+			return NF_ACCEPT;
+		uh = (struct udphdr *)((u8 *)iph + ihl);
+		l4_len = ntohs(iph->tot_len) - ihl;
+	}
+
+	if (ntohs(uh->dest) != ts_port)
+		return NF_ACCEPT;
+
+	return ts_tun_decap(skb, v6, uh, l4_len);
+}
+
 /* ---- netfilter hook trampolines ---------------------------------------- */
 
 static unsigned int hook_v4_out(void *priv, struct sk_buff *skb,
@@ -535,6 +1487,8 @@ static unsigned int hook_v4_out(void *priv, struct sk_buff *skb,
 {
 	if (!skb || !READ_ONCE(psk_set) || peers_empty())
 		return NF_ACCEPT;
+	if (READ_ONCE(ts_mode) == TS_MODE_TUNNEL)
+		return ts_tun_out(skb, false);
 	return process_v4(skb, true);
 }
 
@@ -543,7 +1497,19 @@ static unsigned int hook_v4_in(void *priv, struct sk_buff *skb,
 {
 	if (!skb || !READ_ONCE(psk_set) || peers_empty())
 		return NF_ACCEPT;
+	if (READ_ONCE(ts_mode) == TS_MODE_TUNNEL)
+		return NF_ACCEPT;       /* tunnel decapsulates at LOCAL_IN */
 	return process_v4(skb, false);
+}
+
+static unsigned int hook_v4_local(void *priv, struct sk_buff *skb,
+				  const struct nf_hook_state *state)
+{
+	if (!skb || !READ_ONCE(psk_set) || peers_empty())
+		return NF_ACCEPT;
+	if (READ_ONCE(ts_mode) != TS_MODE_TUNNEL)
+		return NF_ACCEPT;
+	return ts_tun_in(skb, false);
 }
 
 static unsigned int hook_v6_out(void *priv, struct sk_buff *skb,
@@ -551,6 +1517,8 @@ static unsigned int hook_v6_out(void *priv, struct sk_buff *skb,
 {
 	if (!skb || !READ_ONCE(psk_set) || peers_empty())
 		return NF_ACCEPT;
+	if (READ_ONCE(ts_mode) == TS_MODE_TUNNEL)
+		return ts_tun_out(skb, true);
 	return process_v6(skb, true);
 }
 
@@ -559,7 +1527,19 @@ static unsigned int hook_v6_in(void *priv, struct sk_buff *skb,
 {
 	if (!skb || !READ_ONCE(psk_set) || peers_empty())
 		return NF_ACCEPT;
+	if (READ_ONCE(ts_mode) == TS_MODE_TUNNEL)
+		return NF_ACCEPT;
 	return process_v6(skb, false);
+}
+
+static unsigned int hook_v6_local(void *priv, struct sk_buff *skb,
+				  const struct nf_hook_state *state)
+{
+	if (!skb || !READ_ONCE(psk_set) || peers_empty())
+		return NF_ACCEPT;
+	if (READ_ONCE(ts_mode) != TS_MODE_TUNNEL)
+		return NF_ACCEPT;
+	return ts_tun_in(skb, true);
 }
 
 /* ---- /proc/torshield/psk ----------------------------------------------- */
@@ -747,6 +1727,52 @@ static const struct proc_ops peers_fops = {
 	.proc_write   = peers_write,
 };
 
+/* ---- /proc/torshield/mode ---------------------------------------------- */
+/* "tunnel" (default): UDP encapsulation with AEAD, padding and replay
+ * protection.  "stream": the original length-preserving ChaCha20 transform. */
+static int mode_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%s\n",
+		   READ_ONCE(ts_mode) == TS_MODE_TUNNEL ? "tunnel" : "stream");
+	return 0;
+}
+
+static int mode_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, mode_show, NULL);
+}
+
+static ssize_t mode_write(struct file *file, const char __user *ubuf,
+			  size_t count, loff_t *pos)
+{
+	char buf[16];
+	size_t len;
+
+	if (count == 0 || count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+	len = strcspn(buf, "\r\n");
+	buf[len] = '\0';
+
+	if (strcmp(buf, "tunnel") == 0)
+		WRITE_ONCE(ts_mode, TS_MODE_TUNNEL);
+	else if (strcmp(buf, "stream") == 0)
+		WRITE_ONCE(ts_mode, TS_MODE_STREAM);
+	else
+		return -EINVAL;
+	return count;
+}
+
+static const struct proc_ops mode_fops = {
+	.proc_open    = mode_open,
+	.proc_read    = seq_read,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
+	.proc_write   = mode_write,
+};
+
 /* ---- /proc/torshield/stats --------------------------------------------- */
 /* Counters are what the paper needs: how many packets were actually
  * transformed, and why the rest were skipped.  Read-only. */
@@ -762,6 +1788,13 @@ static int stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "gso_in    %lld\n", (long long)atomic64_read(&st_gso_in));
 	seq_printf(m, "skip_frag %lld\n", (long long)atomic64_read(&st_frag));
 	seq_printf(m, "skip_bad  %lld\n", (long long)atomic64_read(&st_bad));
+	seq_printf(m, "tun_out   %lld\n", (long long)atomic64_read(&st_tun_out));
+	seq_printf(m, "tun_in    %lld\n", (long long)atomic64_read(&st_tun_in));
+	seq_printf(m, "tun_rx    %lld\n", (long long)atomic64_read(&st_tun_rx));
+	seq_printf(m, "tun_peer  %lld\n", (long long)atomic64_read(&st_tun_peer));
+	seq_printf(m, "tun_drop  %lld\n", (long long)atomic64_read(&st_tun_drop));
+	seq_printf(m, "tun_replay %lld\n",
+		   (long long)atomic64_read(&st_tun_replay));
 	return 0;
 }
 
@@ -781,7 +1814,7 @@ static const struct proc_ops stats_fops = {
 
 /* All four hooks as one array, so they can be (un)registered per network
  * namespace with a single call. Filled once at module init. */
-static struct nf_hook_ops ts_hooks[4];
+static struct nf_hook_ops ts_hooks[6];
 
 static void fill_hook_ops(void)
 {
@@ -795,6 +1828,11 @@ static void fill_hook_ops(void)
 	nfho_v4_in.hooknum   = NF_INET_PRE_ROUTING;
 	nfho_v4_in.priority  = NF_IP_PRI_FIRST;
 
+	nfho_v4_local.hook     = hook_v4_local;
+	nfho_v4_local.pf       = NFPROTO_IPV4;
+	nfho_v4_local.hooknum  = NF_INET_LOCAL_IN;
+	nfho_v4_local.priority = NF_IP_PRI_FIRST;
+
 	nfho_v6_out.hook     = hook_v6_out;
 	nfho_v6_out.pf       = NFPROTO_IPV6;
 	nfho_v6_out.hooknum  = NF_INET_POST_ROUTING;
@@ -805,10 +1843,17 @@ static void fill_hook_ops(void)
 	nfho_v6_in.hooknum   = NF_INET_PRE_ROUTING;
 	nfho_v6_in.priority  = NF_IP6_PRI_FIRST;
 
+	nfho_v6_local.hook     = hook_v6_local;
+	nfho_v6_local.pf       = NFPROTO_IPV6;
+	nfho_v6_local.hooknum  = NF_INET_LOCAL_IN;
+	nfho_v6_local.priority = NF_IP6_PRI_FIRST;
+
 	ts_hooks[0] = nfho_v4_out;
 	ts_hooks[1] = nfho_v4_in;
-	ts_hooks[2] = nfho_v6_out;
-	ts_hooks[3] = nfho_v6_in;
+	ts_hooks[2] = nfho_v4_local;
+	ts_hooks[3] = nfho_v6_out;
+	ts_hooks[4] = nfho_v6_in;
+	ts_hooks[5] = nfho_v6_local;
 }
 
 /* Register/unregister the hooks in every network namespace, so the module
@@ -839,6 +1884,7 @@ static int __init torshield_init(void)
 	/* 0600: key control is root-only, and nothing is world-readable. */
 	if (!proc_create("psk",    0600, proc_dir, &psk_fops) ||
 	    !proc_create("peers",  0600, proc_dir, &peers_fops) ||
+	    !proc_create("mode",   0600, proc_dir, &mode_fops) ||
 	    !proc_create("stats",  0444, proc_dir, &stats_fops)) {
 		ret = -ENOMEM;
 		goto err_proc;

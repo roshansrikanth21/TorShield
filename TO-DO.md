@@ -1,7 +1,7 @@
 # TorShield — Master To-Do & Evidence Log
 
 **Owner:** V. S. Roshan · **Started:** 2026-10-21 · **Last update:** 2026-10-21
-**Canonical code:** `module/LKM/torshield.c` (v3, ChaCha20).
+**Canonical code:** `module/LKM/torshield.c` (v4 — stream mode **and** UDP tunnel mode).
 The Notion plan was written against `original_repo/LKM/xor_obfuscation.c`; most Phase 0–3
 items were already implemented in v3, so they are marked as such below instead of redone.
 
@@ -16,13 +16,14 @@ Claims are labelled `BUILD-VERIFIED`, `RUNTIME-VERIFIED`, or `STATIC-ONLY`.
 |---|---|
 | Build matrix (6.8 LTS + 6.17 HWE, `W=1`) | **DONE** — clean |
 | Real-kernel test environment | **DONE** — QEMU Ubuntu 24.04, kernel 6.8.0-147 |
-| TCP datapath (small + bulk, GSO on/off, v4 + v6) | **DONE** — integrity + ciphertext verified |
-| UDP datapath (DF on/off, v4 + v6) | **DONE** — keystream reuse eliminated |
-| Fragments | **DONE (fail-open)** — intact, but not obfuscated (documented) |
-| Malformed headers | **DONE (fail-open)** — verified with a doff=0 packet |
-| Module load dependency | **DONE** — `MODULE_SOFTDEP`, `modprobe` verified |
-| AEAD / padding / replay protection | **BLOCKED on decision D1** |
-| Control plane, CI, docs, paper | **TODO** (P2/P3) |
+| **D1: datapath** | **RESOLVED — option B (UDP tunnel)**, now the default mode |
+| Stream mode (legacy, opt-in) | **DONE** — TCP/UDP v4+v6 integrity verified; no AEAD by construction |
+| **Tunnel mode: AEAD + padding + seq + replay** | **DONE** — ChaCha20-Poly1305, 64-byte buckets, 64-packet window |
+| Tunnel integrity (v4 1 MB, v6 256 KB) | **DONE** — 100% byte-exact, independent AEAD verification |
+| Tunnel replay / tamper / non-peer | **DONE** — all dropped, counters exact |
+| Tunnel control plane | **DONE (procfs)** — mode, key, peers, stats |
+| **Hybrid TUN networking (exploration)** | **NEXT — design + prototype** |
+| CI, docs, paper | **TODO** (P2/P3) |
 
 **Critical correction to earlier claims:** before this session the module silently left bulk
 TCP **unencrypted** (GSO path) or, with TSO off, **corrupted 98.8% of the stream**. Both are
@@ -33,22 +34,25 @@ fixed and regression-tested now. Any throughput number measured before today (in
 
 ## B. Decision gates — needed from Roshan
 
-### D1 — Transparent stream (A) or UDP tunnel (B)?  *(blocks P2/P3)*
+### D1 — Transparent stream (A) or UDP tunnel (B)?  **RESOLVED: B**
 
-The module is *length-preserving*: same packet size on the wire. That is exactly why AEAD and
-padding cannot be added on the TCP path:
+**Decision: B — UDP tunnel** is now the default (`ts_mode = TS_MODE_TUNNEL`). The stream
+transform is retained as an opt-in mode via `/proc/torshield/mode` for comparison and for the
+measurement study; it is no longer the default.
 
-* AEAD adds a 16-byte tag; padding adds up to a bucket size.
-* TCP sequence numbers count payload bytes. Injecting bytes desynchronises the stream, ACKs
-  and retransmissions. A transparent TCP transform cannot add bytes without terminating TCP.
+Rationale (and why A cannot carry AEAD): the stream transform is *length-preserving* — same
+packet size on the wire. AEAD adds a 16-byte tag and padding adds up to a bucket size, and TCP
+sequence numbers count payload bytes, so a transparent TCP transform cannot add bytes without
+terminating TCP. Only the tunnel can have real authentication, padding, a packet counter nonce
+and a replay window. Tunnel wire format:
 
-**A. Stay transparent** — ChaCha20 stream, length-preserving, no AEAD, no padding. Honest paper:
-measure the cost and the limits. *(This is what is now correct and tested.)*
+```
+outer IP | UDP:4789 | 16-byte header ('T','S',ver,flags,seq) | padded ciphertext (64-byte buckets) | 16-byte tag
+AAD = header · nonce = XOR-folded (src,dst) || 64-bit BE seq · ChaCha20-Poly1305 (RFC 7539)
+```
 
-**B. Tunnel** — encapsulate the inner packet in UDP, then AEAD + padding + counter nonce +
-replay window are all correct and simple. It becomes a VPN/tunnel, not transparent obfuscation.
-
-**Recommendation:** B for real anti-DPI value; A for the current paper. Not both.
+The AEAD is synchronous by design: the in-kernel ChaCha20 helper plus a hand-written Poly1305
+are used because `gcm(aes)` is `async: yes` and cannot be used from softirq context.
 
 ### D2 — Target kernels
 Confirmed by testing: 6.8.0-147 (Ubuntu 24.04 LTS) and 6.17.0-42 (HWE). Mainline compile
@@ -106,14 +110,59 @@ Legacy `original_repo` builds on 6.8 but not on ≥6.15 (`del_timer` removed). K
 
 ---
 
+## D2. Tunnel datapath (D1 = B) — implementation and defects found by testing
+
+**Architecture.** 6 netfilter hooks per network namespace (registered with
+`register_pernet_subsys`): IPv4/IPv6 × PRE_ROUTING/POST_ROUTING/LOCAL_IN.
+
+* **Egress** — `NF_INET_POST_ROUTING` (last): if the destination is a configured peer, the
+  packet is stolen, fragmented (GSO) per segment, padded, encrypted, wrapped in UDP:4789 and
+  sent with `ip_local_out`/`ip6_local_out`. Outer packets are recognised by port and skip the
+  hook (no recursion).
+* **Ingress** — `NF_INET_LOCAL_IN` (first, after IP reassembly): parse header, look up the peer
+  by source address, verify AEAD, check replay window, decrypt, re-inject with `netif_rx`
+  (`skb->mark = TS_TUN_MARK`).
+* **Fail-closed**: any error in tunnel mode drops the packet, unlike stream mode (fail-open).
+* **MSS clamp**: 1360 (v4) / 1340 (v6) so the outer packet never exceeds 1500.
+* **Replay window**: 64 packets per peer, advanced **after** successful authentication.
+* **Link scope guard**: IPv6 link-local/site-local/loopback and IPv4 169.254/127 sources are
+  never tunneled (they are link-scoped; tunneling them is meaningless).
+
+**Defects found by testing during bring-up (all fixed):**
+
+| # | Symptom | Root cause | Fix |
+|---|---|---|---|
+| D2.1 | Every packet failed authentication (`tun_in 0`, `tun_drop` climbing) | Poly1305 tag computed over the **plaintext** before encryption | Encrypt first, then MAC the ciphertext (RFC 7539 order) |
+| D2.2 | Kernel panic `skb_under_panic` in `tpacket_rcv` | Re-injected skb had `mac_header = 0xffff`; tcpdump's AF_PACKET tap computed a bogus `skb_push` | `skb_reset_mac_header()` on the decapped skb |
+| D2.3 | Replay window could be advanced by unauthenticated packets | Replay check ran before AEAD verification | Authenticate first, then check/advance the window |
+| D2.4 | 3 packets/run dropped as non-peer (`fe80::…`) | IPv6 neighbour advertisements to a peer address were encapsulated | Never tunnel link-local/site-local/loopback sources |
+
+**Known limits of tunnel mode (honest list).** No rekeying or key rotation; no handshake or
+cookie/DoS protection (any source can make the receiver do a Poly1305 check); the peer list is
+global across netns; no PMTU discovery/ICMP relay; large inner UDP datagrams depend on outer IP
+fragmentation and reassembly (not yet tested); single shared PSK.
+
+---
+
 ## E. P2/P3 — remaining backlog
 
-### P2 — Crypto & architecture (blocked on D1)
-- [ ] AEAD + tags (only possible in tunnel mode)
+### P2 — Crypto & architecture
+- [x] AEAD + tags — ChaCha20-Poly1305, tunnel mode (R24)
+- [x] Per-packet sequence + 64-packet replay window (R25)
 - [ ] Per-flow key derivation (HKDF) from a master secret
-- [ ] Replay window / per-packet sequence
-- [ ] Length-preserving MAC alternative for TCP mode, or explicitly drop the integrity claim
-- [ ] Fix TCP seq wrap (rekey per flow at ~2 GB, or counter-based nonce)
+- [ ] Rekeying / key rotation and a handshake (currently one static PSK, no forward secrecy)
+- [ ] DoS hardening: cheap cookie/rate limit before the Poly1305 check on decap
+- [ ] Length-preserving MAC alternative for stream mode, or explicitly drop its integrity claim
+- [ ] Fix TCP seq wrap in stream mode (rekey per flow at ~2 GB, or counter-based nonce)
+
+### P2.5 — Hybrid TUN networking (exploration, in progress)
+- [ ] Virtual L3 netdevice (`torshield0`) with `ndo_start_xmit` reusing the tunnel AEAD/framing
+- [ ] Route-based steering (`ip route … dev torshield0`) instead of netfilter peer matching
+- [ ] Underlay route lookup that cannot recurse into the tunnel device (oif-pinned lookup)
+- [ ] Receive path: deliver decapped packets through the tunnel netdevice
+- [ ] Decide inner-vs-outer address model (same address today; separate tunnel/underlay
+      addresses are needed for a general route-based deployment)
+- [ ] Interop test: netfilter-transparent side ↔ TUN side on the same wire format
 
 ### P3 — Operations, tests, docs
 - [ ] Netlink control plane (replace procfs), kill switch, safe mode, dry-run
@@ -155,6 +204,13 @@ Environment: Ubuntu 24.04 cloud image, kernel `6.8.0-147-generic`, QEMU 8.2 TCG 
 | R18 | IPv6 UDP 2×1000 B | flow labels 1,2; **no reuse**; content OK |
 | R19 | iperf3 TCP 5 s (TCG) | 446.0 Mbps baseline vs **58.1 Mbps** through TorShield, 0 retransmits |
 | R20 | iperf3 UDP 50 M target (TCG) | 16.2 Mbps, 0% loss (emulated CPU bound) |
+| R21 | Tunnel: `make W=1`, 6.8.0-147 + 6.17.0-42 | **PASS** — clean, 0 source warnings |
+| R22 | Tunnel: TCP 1 MB over n1↔n2 (default mode) | **1048576/1048576 correct (100%)**; 1054 tunnel frames, 1054 valid headers, 0 bad padding, 0 plaintext bytes |
+| R23 | Tunnel: IPv6 TCP 256 KB | **262144/262144 correct (100%)** |
+| R24 | Independent AEAD verification — `verify_tunnel.py` (python-`cryptography` 46.0.6) decrypts the on-wire capture | **1054/1054 authenticated**; inner SYN MSS **1360**; frame = outer IP + UDP:4789 + 16-byte header + 64-byte-bucket ciphertext + 16-byte tag |
+| R25 | Replay / tamper / unknown peer (stage16 §4 + stage17) | replay dropped (`tun_replay 1`), tampered new sequence dropped (`tun_drop 1`), framed packet from unknown source dropped (`tun_peer 1`); final `tun_rx = tun_in + 2` exactly; no kernel oops/panic |
+| R26 | Interop: tunnel packet built by an independent Python ChaCha20-Poly1305 sender (`inject.py`) | **accepted and delivered** (`RX b'FROM-PYTHON'`, `tun_in` +1) — format and nonce/AAD agree in both directions |
+| R27 | Regression for D2.4: IPv6 neighbour advertisements (src `fe80::…`) | no longer encapsulated; `tun_peer 0` (was 3 per run before the link-scope guard) |
 
 > R19/R20 are **not paper-grade**: TCG-emulated CPU. They show the direction and the overhead
 > source (per-byte software ChaCha20 + linearise), not real-hardware numbers.
@@ -173,30 +229,51 @@ WSL2 (no root) ── QEMU 8.2 TCG ── Ubuntu 24.04, 6.8.0-147-generic
 
 * Build: `.work/rebuild.sh` (both kernels), `.work/build-w1.sh`.
 * VM: `.work/launch-vm.sh`, SSH `ssh -p 2222 ts@127.0.0.1`.
-* Tests: `.work/vm-src/stage{1..15}.sh`, pcap analyser `.work/vm-src/pcap.py`.
+* Stream-mode tests: `.work/vm-src/stage{1..15}.sh`, pcap analyser `.work/vm-src/pcap.py`.
+* Tunnel tests: `.work/vm-src/stage16.sh` (acceptance: build, load, TCP v4/v6, UDP,
+  replay, tamper) and `.work/vm-src/stage17.sh` (replay/tamper/unknown-peer/interop).
+  Independent checks: `verify_tunnel.py` (decrypts the capture with python-`cryptography`),
+  `inject.py` (builds tunnel packets from scratch), `replay.py` (replays captured frames).
 
 ---
 
 ## H. Known limitations (honest list, for the paper)
 
-1. **No authentication** — a modified ciphertext is accepted (stream cipher only).
-2. **No replay protection.**
-3. **Fragmented traffic is not obfuscated** (passes intact, plaintext).
-4. **IPv6 extension headers are skipped** (plaintext).
-5. **TCP seq wrap** (>4 GB on one connection) reuses the keystream.
-6. **Peer = IP address only**; all ports and all netns share one config.
-7. **No padding/shaping** — packet sizes and timing are unchanged, so the traffic is still
-   fingerprintable; the original README claim that rotation defeats statistical analysis is false.
-8. **Throughput** measured only on emulated hardware.
-9. **`insmod` still fails without the chacha module** — use `modprobe`/`make install`.
+**Tunnel mode (default):**
+
+1. **Static single PSK** — no handshake, no rekeying, no forward secrecy.
+2. **No DoS protection** — every framed packet costs a Poly1305 verification before the replay
+   check, so an off-path sender can force crypto work.
+3. **Peer = IP address only**, and one peer list is shared by every network namespace.
+4. **No PMTU discovery or ICMP relay.** Inner TCP is MSS-clamped; large inner UDP datagrams rely
+   on outer IP fragmentation and reassembly (not yet tested).
+5. **Outer UDP checksum is 0 over IPv4** (legal; integrity comes from the AEAD tag).
+6. **Throughput** measured only on emulated hardware (TCG).
+
+**Stream mode (opt-in, legacy):**
+
+7. **No authentication** — a modified ciphertext is accepted (stream cipher only); no replay protection.
+8. **Fragmented traffic is not obfuscated** (passes intact, plaintext); IPv6 extension headers are skipped.
+9. **TCP seq wrap** (>4 GB on one connection) reuses the keystream.
+10. **No padding/shaping** — packet sizes and timing are unchanged, so the traffic is still
+    fingerprintable; the original README claim that rotation defeats statistical analysis is false.
+
+**Both modes:**
+
+11. Control plane is procfs, not netlink; no kill switch/dry-run/safe mode.
+12. No real-hardware throughput numbers yet.
 
 ---
 
 ## I. Open questions for Roshan
 
-1. **D1** — transparent (A) or tunnel (B)? Everything in P2/P3 depends on it.
-2. **D3** — is the QEMU VM acceptable, or do you want `kalix0`/`meoww` (need login)?
-3. **GitHub** — the fork still has the senior's XOR code only. Pushing v3 needs your credentials;
-   I can prepare commits/branches locally.
+1. **"Shift the hooks to target the socket buffer"** — this is ambiguous: netfilter hooks already
+   receive an `sk_buff`. Did you mean (a) TC clsact/eBPF on `sk_buff`, (b) kprobes on
+   `tcp_sendmsg`/socket-level functions, (c) a netfilter hook that works on skb head/sg data
+   directly (which is what the tunnel now does), or (d) an explicit virtual netdevice?
+2. **Hybrid TUN** — confirm the interpretation: a kernel virtual L3 interface (`torshield0`)
+   steered by routes and reusing the UDP AEAD framing, or `tun(4)` plus a userspace daemon?
+   This decides whether the inner/outer addresses must become distinct.
+3. **D3** — is the QEMU VM acceptable, or do you want `kalix0`/`meoww` (need login)?
 4. **D4** — paper: measurement-study framing confirmed? The 1266 Mbps figure must be withdrawn.
 5. **Authorship** — confirm the author line with the professor before publishing.

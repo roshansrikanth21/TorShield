@@ -15,6 +15,9 @@ modules.order
 torshieldctl
 xorctl
 
+# test captures (binary evidence, reproduced by the stage scripts)
+*.pcap
+
 # editor / os noise
 *.swp
 *~
