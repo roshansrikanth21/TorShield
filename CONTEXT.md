@@ -199,7 +199,7 @@ but no real-hardware overhead measurement has been made, and the original paper'
 ```
 CONTEXT.md                     ← this file (historical handoff; see status note)
 README.md                      ← current modes, build, verified results, limits
-TO-DO.md                       ← master tracker + evidence log R1–R34
+TO-DO.md                       ← master tracker + evidence log R1–R35
 TUN-HYBRID.md                  ← hybrid TUN design and verified results
 paper/
   TorShield_IEEE.docx / .pdf   ← 6-page IEEE paper (formatting/citations fixed;

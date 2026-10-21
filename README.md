@@ -129,8 +129,8 @@ throughput numbers have been measured yet.
 | Tunnel, 60000-byte UDP datagram | **60000/60000 correct (100%)**; outer split into 41 IP fragments |
 | Replay / tampered / unknown-source packet | all dropped; `tun_replay`, `tun_drop`, `tun_peer` counters exact |
 | Packet built by an independent Python sender | accepted and delivered (format/nonce/AAD agree) |
-| Hybrid, IPv4 TCP 1 MB via `ndo_start_xmit` | **100%**; 807/807 frames authenticated; inner MSS 1320; `dev_drop 0` |
-| Hybrid, IPv6 TCP 256 KB via `ndo_start_xmit` | **100%**; 208/208 frames authenticated |
+| Hybrid, IPv4 TCP 1 MB via `ndo_start_xmit` | **100%**; 807/807 frames authenticated; inner MSS 1320; `dev_out 1021`, `dev_drop 0` |
+| Hybrid, IPv6 TCP 256 KB via `ndo_start_xmit` | **100%**; 209/209 frames authenticated |
 | `make W=1` | clean on 6.8.0-147 and 6.17.0-42 |
 
 Two real defects were found by these tests and fixed: the decap read only the

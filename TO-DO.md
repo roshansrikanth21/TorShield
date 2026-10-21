@@ -226,6 +226,7 @@ Environment: Ubuntu 24.04 cloud image, kernel `6.8.0-147-generic`, QEMU 8.2 TCG 
 | R32 | Large inner UDP, 4000-byte datagram, tunnel mode | **4000/4000 correct (100%)**; `tun_out 1`, `tun_in 1`, `tun_drop 0`; outer split into 3 IP fragments |
 | R33 | Large inner UDP, 60000-byte datagram, tunnel mode | **60000/60000 correct (100%)**; `tun_out 2`, `tun_in 2`, `tun_drop 0`; outer split into 41 IP fragments, IDs distinct (3/41 fragments for the two datagrams) |
 | R34 | Reference AEAD on the defragmented 60000-byte capture (`defrag_verify.py`) | **AUTH OK**, inner 60032 bytes — proves the sender seals large payloads correctly and localised D2.5 to the receive path |
+| R35 | Hybrid regression on the final build (after D2.5/D2.6): stage18 | v4 **1048576/1048576 (100%)**, v6 **262144/262144 (100%)**; **807/807** v4 and **209/209** v6 frames authenticated by `verify_tunnel.py`; `dev_out 1021`, `dev_drop 0`, `tun_drop 0` |
 
 > R19/R20 are **not paper-grade**: TCG-emulated CPU. They show the direction and the overhead
 > source (per-byte software ChaCha20 + linearise), not real-hardware numbers.
