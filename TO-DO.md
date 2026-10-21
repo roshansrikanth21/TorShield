@@ -136,11 +136,15 @@ Legacy `original_repo` builds on 6.8 but not on ≥6.15 (`del_timer` removed). K
 | D2.2 | Kernel panic `skb_under_panic` in `tpacket_rcv` | Re-injected skb had `mac_header = 0xffff`; tcpdump's AF_PACKET tap computed a bogus `skb_push` | `skb_reset_mac_header()` on the decapped skb |
 | D2.3 | Replay window could be advanced by unauthenticated packets | Replay check ran before AEAD verification | Authenticate first, then check/advance the window |
 | D2.4 | 3 packets/run dropped as non-peer (`fe80::…`) | IPv6 neighbour advertisements to a peer address were encapsulated | Never tunnel link-local/site-local/loopback sources |
+| D2.5 | Every **fragmented** outer datagram failed authentication (`tun_drop`, AEAD fail with correct lengths) | After IP reassembly the skb is a `frag_list`; the decap read the ciphertext through a raw pointer into the linear head only | `skb_linearize()` before the AEAD, then re-derive the header/ciphertext pointers |
+| D2.6 | All outer datagrams carried IPv4 **ID 0** | Encapsulation zeroed the header and never assigned an ID | Per-packet ID from a module counter |
 
 **Known limits of tunnel mode (honest list).** No rekeying or key rotation; no handshake or
 cookie/DoS protection (any source can make the receiver do a Poly1305 check); the peer list is
-global across netns; no PMTU discovery/ICMP relay; large inner UDP datagrams depend on outer IP
-fragmentation and reassembly (not yet tested); single shared PSK.
+global across netns; no PMTU discovery/ICMP relay; single shared PSK. Large inner UDP datagrams
+rely on outer IP fragmentation and reassembly, which is verified up to 60 KB; the receiver
+linearizes the reassembled skb before the AEAD, so a very large datagram needs a high-order
+atomic allocation and is dropped if that fails.
 
 ---
 
@@ -217,6 +221,9 @@ Environment: Ubuntu 24.04 cloud image, kernel `6.8.0-147-generic`, QEMU 8.2 TCG 
 | R29 | Hybrid: TCP 1 MB through `ndo_start_xmit` (n1 device → n2 netfilter decap; n2 replies via netfilter) | **1048576/1048576 correct (100%)**; 807 outer frames, 807 valid headers, 0 bad padding, 0 plaintext; **807/807 authenticated** by `verify_tunnel.py`; inner SYN MSS **1320**; totals `dev_out 1020`, `dev_drop 0`, `tun_out 173` (both datapaths in one run) |
 | R30 | Hybrid: IPv6 TCP 256 KB through `ndo_start_xmit` | **262144/262144 correct (100%)**; 208 outer frames, 208 valid headers, 0 bad padding; **208/208 authenticated** (`ver=6`) |
 | R31 | Defect found by testing: IPv6 router solicitations (48-byte ICMPv6, dst `ff02::2`) reached `ndo_start_xmit` and were counted as malformed (`dev_drop 3–5/run`) | fixed with a multicast/link-local guard; `dev_drop 0` |
+| R32 | Large inner UDP, 4000-byte datagram, tunnel mode | **4000/4000 correct (100%)**; `tun_out 1`, `tun_in 1`, `tun_drop 0`; outer split into 3 IP fragments |
+| R33 | Large inner UDP, 60000-byte datagram, tunnel mode | **60000/60000 correct (100%)**; `tun_out 2`, `tun_in 2`, `tun_drop 0`; outer split into 41 IP fragments, IDs distinct (3/41 fragments for the two datagrams) |
+| R34 | Reference AEAD on the defragmented 60000-byte capture (`defrag_verify.py`) | **AUTH OK**, inner 60032 bytes — proves the sender seals large payloads correctly and localised D2.5 to the receive path |
 
 > R19/R20 are **not paper-grade**: TCG-emulated CPU. They show the direction and the overhead
 > source (per-byte software ChaCha20 + linearise), not real-hardware numbers.

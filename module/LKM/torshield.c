@@ -607,6 +607,7 @@ struct ts_tun_hdr {
 static atomic64_t st_tun_out, st_tun_in, st_tun_drop, st_tun_replay;
 static atomic64_t st_tun_rx, st_tun_peer;
 static atomic64_t st_dev_out, st_dev_drop;
+static atomic_t ts_ip_id = ATOMIC_INIT(0);   /* outer IPv4 identification */
 
 /* ---- little/big-endian helpers (no arch unaligned header needed) ------- */
 static inline u32 ts_le32(const u8 *p)
@@ -1073,6 +1074,7 @@ static int ts_tun_encap_v4(struct sk_buff *skb, u64 seq, const u8 key[32],
 	oiph->ihl = 5;
 	oiph->tos = 0;
 	oiph->tot_len = htons(total);
+	oiph->id = htons((u16)atomic_inc_return(&ts_ip_id));
 	oiph->ttl = 64;
 	oiph->protocol = IPPROTO_UDP;
 	oiph->saddr = iph->saddr;
@@ -1204,7 +1206,8 @@ static unsigned int ts_tun_decap(struct sk_buff *skb, bool outer_v6,
 	struct ts_peer *p;
 	struct sk_buff *n;
 	u8 key[32], nonce[12];
-	unsigned int ct_len, inner_len;
+	unsigned int ct_len = 0, inner_len;
+	int bad_reason = 1;
 	unsigned long flags;
 	const u8 *ct;
 	const u8 *tag;
@@ -1222,11 +1225,27 @@ static unsigned int ts_tun_decap(struct sk_buff *skb, bool outer_v6,
 	atomic64_inc(&st_tun_rx);
 
 	ct_len = l4_len - sizeof(*uh) - TS_TUN_HDR_LEN - TS_TUN_TAG_LEN;
-	if (ct_len < 16 || (ct_len & 15))
+	if (ct_len < 16 || (ct_len & 15)) {
+		bad_reason = 2;
 		goto bad;
+	}
+	seq = ts_be64((u8 *)th + 8);
+
+	/* The AEAD reads the ciphertext through a raw pointer, so the skb must
+	 * be contiguous.  After IP reassembly (fragmented outer datagrams) it is
+	 * a frag_list and skb->data covers only the first fragment. */
+	if (skb_linearize(skb) < 0) {
+		bad_reason = 7;
+		goto bad;
+	}
+	if (outer_v6) {
+		uh = (struct udphdr *)((u8 *)ipv6_hdr(skb) + sizeof(struct ipv6hdr));
+	} else {
+		uh = (struct udphdr *)((u8 *)ip_hdr(skb) + ip_hdr(skb)->ihl * 4);
+	}
+	th = (struct ts_tun_hdr *)((u8 *)uh + sizeof(*uh));
 	ct = (u8 *)th + TS_TUN_HDR_LEN;
 	tag = ct + ct_len;
-	seq = ts_be64((u8 *)th + 8);
 
 	spin_lock_irqsave(&cfg_lock, flags);
 	p = outer_v6 ? peer_find_locked(AF_INET6, &ipv6_hdr(skb)->saddr)
@@ -1256,6 +1275,8 @@ static unsigned int ts_tun_decap(struct sk_buff *skb, bool outer_v6,
 	if (!ts_aead_open(key, nonce, (u8 *)th, TS_TUN_HDR_LEN,
 			  (u8 *)ct, ct_len, tag)) {
 		atomic64_inc(&st_tun_drop);
+		pr_info_ratelimited("torshield: decap AEAD fail r=6 l4=%u ct=%u seq=%llu flags=%u\n",
+				    l4_len, ct_len, seq, th->flags);
 		return NF_DROP;
 	}
 
@@ -1278,24 +1299,34 @@ static unsigned int ts_tun_decap(struct sk_buff *skb, bool outer_v6,
 	if (v6) {
 		struct ipv6hdr *in = (struct ipv6hdr *)ct;
 
-		if (ct_len < sizeof(*in) || in->version != 6)
+		if (ct_len < sizeof(*in) || in->version != 6) {
+			bad_reason = 3;
 			goto bad;
+		}
 		inner_len = sizeof(*in) + ntohs(in->payload_len);
 	} else {
 		struct iphdr *in = (struct iphdr *)ct;
 
-		if (ct_len < sizeof(*in) || in->version != 4 || in->ihl < 5)
+		if (ct_len < sizeof(*in) || in->version != 4 || in->ihl < 5) {
+			bad_reason = 3;
 			goto bad;
+		}
 		inner_len = ntohs(in->tot_len);
-		if (inner_len < in->ihl * 4)
+		if (inner_len < in->ihl * 4) {
+			bad_reason = 4;
 			goto bad;
+		}
 	}
-	if (inner_len > ct_len)
+	if (inner_len > ct_len) {
+		bad_reason = 4;
 		goto bad;
+	}
 
 	n = alloc_skb(inner_len + 128, GFP_ATOMIC);
-	if (!n)
+	if (!n) {
+		bad_reason = 5;
 		goto bad;
+	}
 	skb_reserve(n, 128);
 	memcpy(skb_put(n, inner_len), ct, inner_len);
 	skb_reset_network_header(n);
@@ -1313,6 +1344,8 @@ static unsigned int ts_tun_decap(struct sk_buff *skb, bool outer_v6,
 
 bad:
 	atomic64_inc(&st_tun_drop);
+	pr_info_ratelimited("torshield: decap bad r=%d l4=%u ct=%u\n",
+			    bad_reason, l4_len, ct_len);
 	return NF_DROP;
 }
 
