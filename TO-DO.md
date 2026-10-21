@@ -22,8 +22,9 @@ Claims are labelled `BUILD-VERIFIED`, `RUNTIME-VERIFIED`, or `STATIC-ONLY`.
 | Tunnel integrity (v4 1 MB, v6 256 KB) | **DONE** — 100% byte-exact, independent AEAD verification |
 | Tunnel replay / tamper / non-peer | **DONE** — all dropped, counters exact |
 | Tunnel control plane | **DONE (procfs)** — mode, key, peers, stats |
-| **Hybrid TUN networking** | **DONE (prototype)** — `torshield0` netdevice, v4 + v6 verified |
-| CI, docs, paper | **TODO** (P2/P3) |
+| Hybrid TUN networking | **DONE (prototype)** — `torshield0` netdevice, v4 + v6 verified |
+| Docs (README + module README + CONTEXT) | **DONE** — rewritten to v4, false claims withdrawn |
+| CI, threat model, paper | **TODO** (P2/P3) |
 
 **Critical correction to earlier claims:** before this session the module silently left bulk
 TCP **unencrypted** (GSO path) or, with TSO off, **corrupted 98.8% of the stream**. Both are
@@ -177,7 +178,8 @@ atomic allocation and is dropped if that fails.
 - [ ] CI matrix (Ubuntu 22.04/24.04, Fedora, 6.8/6.17) + sparse/smatch
 - [ ] Bypass list (loopback, multicast, DHCP, mDNS, NTP)
 - [ ] Per-interface / per-netns policy
-- [ ] README rewrite + threat model + SECURITY.md; withdraw the false claims
+- [x] README rewrite (v4 tunnel/hybrid, verified results, limits) + withdraw the false claims
+- [ ] Threat model + SECURITY.md
 - [ ] Real-hardware throughput (KVM or physical), with and without GSO
 - [ ] `torshield_testbed.sh` still embeds the **v2** SipHash module — do not use it for paper numbers
 
