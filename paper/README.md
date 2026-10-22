@@ -61,6 +61,14 @@ conference template's `\documentclass[conference]{IEEEtran}` settings.
 - **Missing before submission:** the one-page resume and the one-page
   supervisor recommendation are not in this repository. Merge them with the
   four-page abstract only after both are final.
+- **Merge order and check:** keep the abstract first, then the resume, then the
+  supervisor recommendation:
+  ```bash
+  pdfunite TorShield_RAIT2027_DC.pdf resume.pdf supervisor_lor.pdf \
+    TorShield_RAIT2027_DC_submission.pdf
+  pdfinfo TorShield_RAIT2027_DC_submission.pdf | grep Pages   # must be 6
+  ```
+  Do not add a cover page or a table of contents.
 
 Do not submit the six-page `TorShield_IEEE.pdf` to the Doctoral Consortium. It
 is the archival full paper, not the four-page Doctoral Consortium abstract.
