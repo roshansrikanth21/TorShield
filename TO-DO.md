@@ -25,7 +25,7 @@ Claims are labelled `BUILD-VERIFIED`, `RUNTIME-VERIFIED`, or `STATIC-ONLY`.
 | Hybrid TUN networking | **DONE (prototype)** — `torshield0` netdevice, v4 + v6 verified |
 | Cryptokey routing | **DONE (prototype)** — per-peer keys, allowed prefixes, endpoint roaming |
 | Manual key rotation | **DONE (prototype)** — dual-key grace + explicit commit; no handshake/forward secrecy (R51) |
-| TC clsact/eBPF egress (`tc` mode) | **DONE (prototype)** — LPM redirect to `torshield0`, v4 + v6 verified |
+| TC clsact/eBPF egress (`tc` mode) | **DONE (prototype)** — LPM redirect to `torshield0`, v4 + v6 verified; kernel `LOCAL_OUT`/`FORWARD` fail-closed guard (R53/R54); loader auto-fills from peers and invalidates stale maps (R56) |
 | Native throughput (WSL2 6.18.54.1) | **DONE** — 1-stream 910–965 Mbit/s, 4-stream 3.02–3.35 Gbit/s, 30 s at 3.40 Gbit/s |
 | DoS rate limiter | **DONE** — per-source fixed window before the AEAD; off by default |
 | Docs (README + module README + CONTEXT) | **DONE** — rewritten to v4, false claims withdrawn |
@@ -121,8 +121,9 @@ Legacy `original_repo` builds on 6.8 but not on ≥6.15 (`del_timer` removed). K
 
 ## D2. Tunnel datapath (D1 = B) — implementation and defects found by testing
 
-**Architecture.** 6 netfilter hooks per network namespace (registered with
-`register_pernet_subsys`): IPv4/IPv6 × PRE_ROUTING/POST_ROUTING/LOCAL_IN.
+**Architecture.** 10 netfilter hooks per network namespace (registered with
+`register_pernet_subsys`): IPv4/IPv6 × PRE_ROUTING/POST_ROUTING/LOCAL_IN plus the
+two fail-closed TC guard hooks per family (`LOCAL_OUT` and `FORWARD`).
 
 * **Egress** — `NF_INET_POST_ROUTING` (last): if the destination is a configured peer, the
   packet is stolen, segmented (GSO) per segment, padded, encrypted, wrapped in UDP:4789 and
@@ -200,14 +201,20 @@ that fails.
 - [x] Independent AEAD verification of TC-path captures, per-peer keys vs global PSK (R39)
 - [x] Fail-safe supervisor: `torshield-tc watch` polls the egress filter and reverts the mode
       to `tunnel` when the classifier disappears (R42)
-- [ ] True fail-closed steering at a point before `POST_ROUTING`; TC egress cannot provide it
-      by construction (the watchdog only bounds the window to one poll)
+- [x] Kernel fail-closed guard at `LOCAL_OUT`/`FORWARD` (before `POST_ROUTING`): drops
+      peer packets unless the route output device is a `torshield` device or still has a live
+      egress classifier (R53/R54). Classifier/qdisc deletion tested, including the
+      `FORWARD` path. A narrow guard-to-egress in-flight race remains and is documented;
+      absolute zero-race closure needs a last-chance xmit guard or one steering point.
+- [x] Loader reads every `allowed=` prefix from `/proc/torshield/peers`; peer add/del/clear
+      while mode=`tc` forces `tunnel` until reattach, so stale maps cannot omit a prefix (R56)
 - [ ] Per-netns map lifecycle and pinned statistics (the loader currently owns the maps)
 - [ ] Offload/segmentation tuning for the TC path
 
 ### P3 — Operations, tests, docs
 - [ ] Netlink control plane (replace procfs), kill switch, safe mode, dry-run
-- [ ] netns integration harness committed to the repo (currently in `.work/vm-src/`)
+- [ ] netns integration harness committed to the repo (stages 24/25 are now tracked; the older
+      stage scripts still live in `.work/vm-src/`)
 - [ ] KUnit tests for length/parse arithmetic
 - [x] CI build on Ubuntu 24.04: module with `W=1` + TC object/loader
 - [ ] Broader CI matrix (Ubuntu 22.04, Fedora) + sparse/smatch
@@ -280,6 +287,11 @@ Environment: Ubuntu 24.04 cloud image, kernel `6.8.0-147-generic`, QEMU 8.2 TCG 
 | R50 | Native TC wire verification | v4 capture **210/210** authenticated with `K`, **0/210** with the global PSK, outer `10.0.1.1→10.0.1.2`. Native **v6** pcap capture is empty in this WSL harness (`-i any` shows the outer packet on `eth0`, `-Q in -i veth2` sees none), so the v6 wire claim remains the QEMU **68/68** result (R39), not a native claim |
 | R51 | Manual per-peer rekey, native stage23 | Egress capture on n2 showed key id **4290739141 → 1666914373** (seq 2 → 4) after `rekey-peer`; the peer printed `prev=4290739141`; old and new keys were both accepted during grace (**OLD-1, OLD-2, NEW-1, NEW-2**, 4/4); `rekey-commit` removed `prev`; the next old-key packet was rejected as non-peer (`tun_peer +1`, `tun_drop +0`); delta `tun_in 4`, `tun_rx 5`, `tun_replay 0`; same-key no-op rc=0, second rotation before commit rc=1 (state unchanged), commit-without-prev and invalid-hex rc=1 |
 | R52 | Regression on the rekey build, native 6.18.54.1 | stages 16/17/20 unchanged (TCP **100%**, replay **1**, tamper **1**, unknown peer **1**, ACL **1**); stage21 TC v4 **256/256**, v6 **64/64**, `dev_out 647`, `tun_out 0`, detach fallback **16/16**; stage22 off: all **1000** reached the AEAD; at 50 pps: **950** limited and **50** reached it; echo **64/64** |
+| R53 | TC fail-closed guard, `LOCAL_OUT`, native 6.18.54.1 (`stage24.sh`) | Baseline echo **16/16**. Delete egress classifier while mode=`tc`: client **sent=0, blocked=8 (`EPERM`)**, peer server **0**, `tc_guard +8`, `dev_out +0`, `tun_out +0`. Delete clsact qdisc: same **0/8**, server **0**, `tc_guard +8`, `dev_out +0`, `tun_out +0`. Reattach: echo **16/16**; detach: netfilter fallback **8/8**; final `tc_guard 16` |
+| R54 | TC fail-closed guard, `FORWARD`, native 6.18.54.1 (`stage25.sh`) | AF_PACKET injection on n1 bypasses n1's `LOCAL_OUT`. Classifier absent: n2 received **8** forwarded inner packets, n3 outer **0**, `tc_guard +8`, `dev_out +0`. Classifier present: `tc_guard +0`, `dev_out +8`, n3 `tun_rx +8`. Delete classifier: n3 outer **0**, `tc_guard +8`, `dev_out +0`. Final `tc_guard 16`, `dev_out 8`, `tun_rx 8` |
+| R55 | Full regression after the TC guard, native 6.18.54.1 | Stages 16/17: v4 1 MB and v6 256 KB TCP **100%**; replay **1**; tamper **1**; unknown peer **1**; ACL **1**; stage20 roam **1**. Stage21: v4 TC **256/256**, v6 **64/64**, `dev_out 647`, `tun_out 0`, detach fallback **16/16**. Stage22: off all **1000** reach AEAD; 50 pps **950** limited / **50** reach; echo **64/64**. Stage23 rekey PASS (old+new grace, commit rejects old). Stage24/25 PASS |
+| R56 | Loader map completeness and peer-change invalidation, native 6.18.54.1 | `stage24.sh` attached n1 with **no `-4/-6`** and the loader reported **2 IPv4 + 2 IPv6** prefixes read from `/proc/torshield/peers`; baseline echo **16/16**. While mode=`tc`, `add-peer 10.0.9.9`, `del-peer 10.0.9.9`, and `clear-peers` each changed `/proc/torshield/mode` to `tunnel` (`PASS: peer add/del/clear forced tunnel mode`) |
+| R57 | Final build, after loader auto-fill and peer invalidation | `make W=1` clean on **6.8.0-147** and **6.17.0-42** (real Ubuntu header trees, 6.17 common header package restored); native 6.18.54.1 `W=1` clean; `make -C tc` builds classifier and loader with `-Wall -Wextra` clean |
 
 > R19/R20 are **not paper-grade**: TCG-emulated CPU. They show the direction and the overhead
 > source (per-byte software ChaCha20 + linearise), not real-hardware numbers.

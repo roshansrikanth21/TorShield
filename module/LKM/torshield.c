@@ -60,6 +60,11 @@
 #include <net/addrconf.h>
 #include <linux/netdevice.h>
 #include <linux/if_ether.h>
+#ifdef CONFIG_NET_XGRESS
+#include <linux/filter.h>
+#include <linux/bpf_mprog.h>
+#include <net/tcx.h>
+#endif
 
 #define TORSHIELD_PROC_DIR   "torshield"
 
@@ -141,6 +146,8 @@ MODULE_PARM_DESC(ts_debug, "log TC redirect header offsets (diagnostics)");
 
 static struct nf_hook_ops nfho_v4_out, nfho_v4_in, nfho_v4_local;
 static struct nf_hook_ops nfho_v6_out, nfho_v6_in, nfho_v6_local;
+static struct nf_hook_ops nfho_v4_guard_out, nfho_v4_guard_fwd;
+static struct nf_hook_ops nfho_v6_guard_out, nfho_v6_guard_fwd;
 static struct proc_dir_entry *proc_dir;
 
 /* ---- counters (observability; one atomic per event, no locking) -------- */
@@ -362,6 +369,20 @@ static struct ts_peer *peer_lookup_dst_locked(u8 family, const void *addr)
 		}
 	}
 	return best;
+}
+
+/* Non-mutating peer lookup for the pre-routing TC guard.  It must not
+ * allocate a sequence number: a packet that is later dropped by the guard
+ * would otherwise consume a replay-window slot. */
+static bool ts_peer_match(u8 family, const void *daddr)
+{
+	unsigned long flags;
+	bool found;
+
+	spin_lock_irqsave(&cfg_lock, flags);
+	found = peer_lookup_dst_locked(family, daddr) != NULL;
+	spin_unlock_irqrestore(&cfg_lock, flags);
+	return found;
 }
 
 /* Egress lookup + sequence allocation in one locked section.  Copies the key,
@@ -785,6 +806,7 @@ static atomic64_t st_tun_out, st_tun_in, st_tun_drop, st_tun_replay;
 static atomic64_t st_tun_rx, st_tun_peer, st_tun_acl, st_tun_roam;
 static atomic64_t st_dev_out, st_dev_drop;
 static atomic64_t st_tun_rlimit;
+static atomic64_t st_tc_guard_drop;
 static atomic_t ts_ip_id = ATOMIC_INIT(0);   /* outer IPv4 identification */
 
 /* Cheap pre-AEAD DoS bound: a fixed-window per-source packet counter.  It is
@@ -2141,6 +2163,126 @@ static bool ts_is_tun_dev(const struct net_device *dev)
 	return dev && dev->rtnl_link_ops == &ts_link_ops;
 }
 
+/*
+ * Is the TC egress program still attached to this output device?
+ *
+ * TC egress runs after POST_ROUTING, so accepting a peer packet there and
+ * hoping the classifier is still present is fail-open: deleting the filter
+ * makes the packet leave in clear.  The guard below runs at LOCAL_OUT/FORWARD
+ * (both before POST_ROUTING) and requires a live egress hook on the device
+ * the route selected.
+ *
+ * There are two attachment styles in the kernel:
+ *   - TCX: the program is in dev->tcx_egress's bpf_mprog.  Check its name.
+ *   - legacy clsact + cls_bpf: the program is in the clsact mini_Qdisc
+ *     filter chain, linked from tcx_egress.  Check that a bpf classifier is
+ *     present there.
+ * A qdisc or filter deletion clears one of these; a manual "echo tc" with
+ * nothing attached fails closed.
+ */
+static bool ts_tc_egress_armed(const struct net_device *dev)
+{
+#ifdef CONFIG_NET_XGRESS
+	struct bpf_mprog_entry *entry;
+	struct bpf_mprog_fp *fp;
+	struct bpf_prog *prog;
+	bool armed = false;
+
+	if (!dev)
+		return false;
+
+	rcu_read_lock();
+	entry = rcu_dereference(dev->tcx_egress);
+	if (!entry)
+		goto out;
+
+	bpf_mprog_foreach_prog(entry, fp, prog) {
+		if (prog->aux &&
+		    !strncmp(prog->aux->name, "ts_tc_egress",
+			     BPF_OBJ_NAME_LEN)) {
+			armed = true;
+			break;
+		}
+	}
+	if (!armed) {
+		struct mini_Qdisc *miniq;
+		struct tcf_proto *tp;
+
+		miniq = rcu_dereference(tcx_entry(entry)->miniq);
+		if (miniq) {
+			tp = READ_ONCE(miniq->filter_list);
+			if (tp && tp->ops && !strcmp(tp->ops->kind, "bpf"))
+				armed = true;
+		}
+	}
+out:
+	rcu_read_unlock();
+	return armed;
+#else
+	return false;
+#endif
+}
+
+/*
+ * Fail-closed guard for TC mode.  A peer-destined packet may only continue if
+ * the route's output device is either a torshield device (which encapsulates
+ * in ndo_start_xmit) or still has the TC egress classifier attached.  If the
+ * classifier has been deleted, drop here instead of letting POST_ROUTING hand
+ * the plaintext packet to the wire.
+ */
+static unsigned int ts_tc_guard(struct sk_buff *skb, bool v6,
+				const struct nf_hook_state *state)
+{
+	struct net_device *dev;
+	const void *daddr;
+
+	if (!skb || READ_ONCE(ts_mode) != TS_MODE_TC)
+		return NF_ACCEPT;
+
+	if (v6) {
+		if (skb->len < sizeof(struct ipv6hdr))
+			return NF_ACCEPT;
+		if (ts_v6_local_scope(&ipv6_hdr(skb)->saddr))
+			return NF_ACCEPT;
+		daddr = &ipv6_hdr(skb)->daddr;
+	} else {
+		if (skb->len < sizeof(struct iphdr))
+			return NF_ACCEPT;
+		if (ts_v4_local_scope(ip_hdr(skb)->saddr))
+			return NF_ACCEPT;
+		daddr = &ip_hdr(skb)->daddr;
+	}
+
+	if (!ts_peer_match(v6 ? AF_INET6 : AF_INET, daddr))
+		return NF_ACCEPT;
+
+	/* At FORWARD, skb_dst() can still be the input route; state->out is
+	 * the device selected for transmission.  Use it when available. */
+	dev = state && state->out ? state->out :
+	      (skb_dst(skb) ? skb_dst(skb)->dev : NULL);
+	/* A route into a torshield device is already a safe, encapsulating
+	 * path; it does not depend on the underlay's TC classifier. */
+	if (ts_is_tun_dev(dev))
+		return NF_ACCEPT;
+	if (ts_tc_egress_armed(dev))
+		return NF_ACCEPT;
+
+	atomic64_inc(&st_tc_guard_drop);
+	return NF_DROP;
+}
+
+static unsigned int hook_v4_guard(void *priv, struct sk_buff *skb,
+				  const struct nf_hook_state *state)
+{
+	return ts_tc_guard(skb, false, state);
+}
+
+static unsigned int hook_v6_guard(void *priv, struct sk_buff *skb,
+				  const struct nf_hook_state *state)
+{
+	return ts_tc_guard(skb, true, state);
+}
+
 /* ---- netfilter hook trampolines ---------------------------------------- */
 
 static unsigned int hook_v4_out(void *priv, struct sk_buff *skb,
@@ -2388,6 +2530,18 @@ static int parse_key_hex(const char *hex, u8 key[CHACHA_KEY_SIZE])
 	return 0;
 }
 
+/* A live TC classifier's LPM maps are a snapshot of the peer prefixes.  If the
+ * peer list changes, the old maps no longer describe the policy; fall back to
+ * netfilter so the change cannot be forwarded in clear until the loader has
+ * rebuilt the maps and re-entered TC mode. */
+static void peer_change_leaves_tc(void)
+{
+	if (READ_ONCE(ts_mode) == TS_MODE_TC) {
+		WRITE_ONCE(ts_mode, TS_MODE_TUNNEL);
+		pr_info("torshield: peer list changed; mode=tunnel until torshield-tc reattaches\n");
+	}
+}
+
 static ssize_t peers_write(struct file *file, const char __user *ubuf,
 			   size_t count, loff_t *pos)
 {
@@ -2396,7 +2550,7 @@ static ssize_t peers_write(struct file *file, const char __user *ubuf,
 	union { __be32 v4; struct in6_addr v6; } addr;
 	struct ts_peer *p, *tmp;
 	unsigned long flags;
-	bool add, added = false;
+	bool add, added = false, removed = false;
 	int i, ret = -EINVAL;
 
 	if (count == 0 || count > 1024)
@@ -2412,6 +2566,7 @@ static ssize_t peers_write(struct file *file, const char __user *ubuf,
 
 	if (!strcmp(s, "clear")) {
 		peers_clear();
+		peer_change_leaves_tc();
 		kfree(buf);
 		return count;
 	}
@@ -2434,10 +2589,13 @@ static ssize_t peers_write(struct file *file, const char __user *ubuf,
 			     ipv6_addr_equal(&p->addr.v6, &addr.v6))) {
 				list_del(&p->list);
 				kfree(p);
+				removed = true;
 				break;
 			}
 		}
 		spin_unlock_irqrestore(&cfg_lock, flags);
+		if (removed)
+			peer_change_leaves_tc();
 		ret = count;
 		goto out;
 	}
@@ -2510,6 +2668,8 @@ static ssize_t peers_write(struct file *file, const char __user *ubuf,
 	spin_unlock_irqrestore(&cfg_lock, flags);
 	if (!added)
 		kfree(p);               /* already present */
+	else
+		peer_change_leaves_tc();
 	ret = count;
 	goto out;
 
@@ -2715,6 +2875,8 @@ static int stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "tun_rlimit %lld\n", (long long)atomic64_read(&st_tun_rlimit));
 	seq_printf(m, "dev_out   %lld\n", (long long)atomic64_read(&st_dev_out));
 	seq_printf(m, "dev_drop  %lld\n", (long long)atomic64_read(&st_dev_drop));
+	seq_printf(m, "tc_guard  %lld\n",
+		   (long long)atomic64_read(&st_tc_guard_drop));
 	return 0;
 }
 
@@ -2732,12 +2894,32 @@ static const struct proc_ops stats_fops = {
 
 /* ---- module init / exit ------------------------------------------------ */
 
-/* All four hooks as one array, so they can be (un)registered per network
+/* All hooks as one array, so they can be (un)registered per network
  * namespace with a single call. Filled once at module init. */
-static struct nf_hook_ops ts_hooks[6];
+static struct nf_hook_ops ts_hooks[10];
 
 static void fill_hook_ops(void)
 {
+	nfho_v4_guard_out.hook     = hook_v4_guard;
+	nfho_v4_guard_out.pf       = NFPROTO_IPV4;
+	nfho_v4_guard_out.hooknum  = NF_INET_LOCAL_OUT;
+	nfho_v4_guard_out.priority = NF_IP_PRI_FIRST;
+
+	nfho_v4_guard_fwd.hook     = hook_v4_guard;
+	nfho_v4_guard_fwd.pf       = NFPROTO_IPV4;
+	nfho_v4_guard_fwd.hooknum  = NF_INET_FORWARD;
+	nfho_v4_guard_fwd.priority = NF_IP_PRI_FIRST;
+
+	nfho_v6_guard_out.hook     = hook_v6_guard;
+	nfho_v6_guard_out.pf       = NFPROTO_IPV6;
+	nfho_v6_guard_out.hooknum  = NF_INET_LOCAL_OUT;
+	nfho_v6_guard_out.priority = NF_IP6_PRI_FIRST;
+
+	nfho_v6_guard_fwd.hook     = hook_v6_guard;
+	nfho_v6_guard_fwd.pf       = NFPROTO_IPV6;
+	nfho_v6_guard_fwd.hooknum  = NF_INET_FORWARD;
+	nfho_v6_guard_fwd.priority = NF_IP6_PRI_FIRST;
+
 	nfho_v4_out.hook     = hook_v4_out;
 	nfho_v4_out.pf       = NFPROTO_IPV4;
 	nfho_v4_out.hooknum  = NF_INET_POST_ROUTING;
@@ -2768,12 +2950,16 @@ static void fill_hook_ops(void)
 	nfho_v6_local.hooknum  = NF_INET_LOCAL_IN;
 	nfho_v6_local.priority = NF_IP6_PRI_FIRST;
 
-	ts_hooks[0] = nfho_v4_out;
-	ts_hooks[1] = nfho_v4_in;
-	ts_hooks[2] = nfho_v4_local;
-	ts_hooks[3] = nfho_v6_out;
-	ts_hooks[4] = nfho_v6_in;
-	ts_hooks[5] = nfho_v6_local;
+	ts_hooks[0] = nfho_v4_guard_out;
+	ts_hooks[1] = nfho_v4_guard_fwd;
+	ts_hooks[2] = nfho_v6_guard_out;
+	ts_hooks[3] = nfho_v6_guard_fwd;
+	ts_hooks[4] = nfho_v4_out;
+	ts_hooks[5] = nfho_v4_in;
+	ts_hooks[6] = nfho_v4_local;
+	ts_hooks[7] = nfho_v6_out;
+	ts_hooks[8] = nfho_v6_in;
+	ts_hooks[9] = nfho_v6_local;
 }
 
 /* Register/unregister the hooks in every network namespace, so the module

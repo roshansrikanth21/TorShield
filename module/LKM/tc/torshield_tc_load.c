@@ -8,11 +8,18 @@
  *       -4 10.0.0.1/32 -4 10.0.0.2/32 \
  *       -6 fd00::1/128 -6 fd00::2/128
  *
- * The helper loads tc/torshield_tc.o, fills the LPM tries with the supplied
- * peer prefixes, points cfg at the torshield netdevice, and attaches the
- * program to the underlay's clsact egress hook.  Only then does it switch
+ * The helper loads tc/torshield_tc.o, reads every allowed prefix from
+ * /proc/torshield/peers (plus any extra -4/-6 arguments), fills the LPM tries,
+ * points cfg at the torshield netdevice, and attaches the program to the
+ * underlay's clsact egress hook.  Only then does it switch
  * /proc/torshield/mode to "tc".  detach reverses the order, so traffic falls
- * back to the netfilter tunnel path before the classifier disappears.
+ * back to the netfilter tunnel path before the classifier disappears.  A peer
+ * add/del/clear while mode is "tc" forces mode back to "tunnel"; rerun attach
+ * to rebuild the maps.
+ *
+ * The kernel module's LOCAL_OUT/FORWARD guard is the fail-closed boundary; the
+ * attach/detach ordering and the optional "watch" subcommand only reduce the
+ * time spent in the TC path after an unexpected classifier removal.
  */
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -62,6 +69,8 @@ static void usage(const char *prog)
 		"usage: %s attach|detach -i UNDERLAY -d TORSHIELD_DEV\n"
 		"       [-o OBJECT] [-4 CIDR]... [-6 CIDR]...\n"
 		"       [-m MODE_FILE]\n"
+		"       (allowed prefixes are read from /proc/torshield/peers;\n"
+		"        -4/-6 add extra prefixes)\n"
 		"       %s watch -i UNDERLAY [-m MODE_FILE] [-n INTERVAL_MS] [-x]\n",
 		prog, prog);
 }
@@ -127,12 +136,13 @@ static void on_signal(int sig)
 }
 
 /*
- * The kernel cannot fail closed at TC: POST_ROUTING runs before TC egress, so
- * tc mode bypasses the netfilter encap and relies on the classifier.  This
- * watchdog bounds that window: while the mode is "tc" it checks that the
- * classifier is still on the underlay and reverts to "tunnel" (netfilter
- * encapsulation) if it is not.  It is not a substitute for a real supervisor,
- * but it makes an accidental qdisc/filter removal fail safe within one poll.
+ * The kernel's LOCAL_OUT/FORWARD guard (see torshield.c) is the fail-closed
+ * security boundary: it drops peer packets when the egress classifier is
+ * missing.  This watchdog is a recovery aid: while the mode is "tc" it checks
+ * that the classifier is still on the underlay and reverts to "tunnel"
+ * (netfilter encapsulation) if it is not.  Run it under a supervisor so the
+ * system returns to the transparent path promptly after an accidental
+ * qdisc/filter removal; do not treat it as the thing that prevents a leak.
  */
 static int run_watch(const char *ifname, const char *mode_path,
 		     int interval_ms, bool exit_after)
@@ -196,6 +206,51 @@ static int parse_prefix(const char *s, int family)
 			return -1;
 		n6++;
 	}
+	return 0;
+}
+
+/*
+ * The kernel peer table is the source of truth for cryptokey routing.  Read
+ * every "allowed=" prefix from /proc/torshield/peers and add it to the maps.
+ * This means an operator cannot forget a prefix on the command line and leave
+ * a live classifier that silently fails to redirect it; -4/-6 remain additive
+ * for exceptional cases.  If the peer list changes later, the kernel forces
+ * mode back to "tunnel" until this loader is run again.
+ */
+static int add_kernel_peer_prefixes(void)
+{
+	FILE *f;
+	char line[4096];
+
+	f = fopen("/proc/torshield/peers", "r");
+	if (!f) {
+		fprintf(stderr, "torshield-tc: cannot read /proc/torshield/peers: %s\n",
+			strerror(errno));
+		return -1;
+	}
+	while (fgets(line, sizeof(line), f)) {
+		char *allowed = strstr(line, "allowed=");
+		char *nl;
+		char *tok;
+
+		if (!allowed)
+			continue;
+		allowed += strlen("allowed=");
+		nl = strpbrk(allowed, "\r\n");
+		if (nl)
+			*nl = '\0';
+		for (tok = strtok(allowed, ","); tok; tok = strtok(NULL, ",")) {
+			int family = strchr(tok, ':') ? AF_INET6 : AF_INET;
+
+			if (parse_prefix(tok, family)) {
+				fprintf(stderr, "torshield-tc: bad peer prefix: %s\n",
+					tok);
+				fclose(f);
+				return -1;
+			}
+		}
+	}
+	fclose(f);
 	return 0;
 }
 
@@ -331,6 +386,9 @@ int main(int argc, char **argv)
 		fprintf(stderr, "torshield-tc: no such interface %s\n", tsdev);
 		return 1;
 	}
+
+	if (add_kernel_peer_prefixes())
+		return 1;
 
 	obj = bpf_object__open_file(obj_path, NULL);
 	if (!obj) {

@@ -7,7 +7,8 @@ on 6.8.0-147 (QEMU) and reproduced natively on 6.18.54.1 (WSL2/Hyper-V).
 `ts_newlink`, `ts_link_ops`, `TS_MODE_HYBRID`, `TS_MODE_TC`;
 `module/LKM/tc/` — eBPF classifier and libbpf loader.
 **Tests:** `.work/vm-src/stage18.sh` (routes), `.work/vm-src/stage21.sh` (TC),
-`.work/vm-src/stage20.sh` (cryptokey routing).
+`.work/vm-src/stage20.sh` (cryptokey routing), `.work/vm-src/stage24.sh`
+(`LOCAL_OUT` fail-closed), `.work/vm-src/stage25.sh` (`FORWARD` fail-closed).
 
 ---
 
@@ -171,9 +172,12 @@ classifier on the underlay's egress:
   `bpf_redirect`ed to the device; outer frames carry `TS_TC_MARK` so they are not redirected
   again. Multicast/link-local destinations and link-local sources are skipped.
 * `module/LKM/tc/torshield_tc_load.c` — `torshield-tc attach|detach` (libbpf). It loads the
-  object, fills the maps from `-4`/`-6` prefixes, attaches to the underlay's clsact egress,
-  and only then writes `tc` to `/proc/torshield/mode`. `detach` writes `tunnel` first and
-  then removes the qdisc, so traffic falls back to the netfilter path.
+  object, reads every `allowed=` prefix from `/proc/torshield/peers` (plus optional
+  extra `-4`/`-6`), fills the maps, attaches to the underlay's clsact egress, and only
+  then writes `tc` to `/proc/torshield/mode`. `detach` writes `tunnel` first and then
+  removes the qdisc, so traffic falls back to the netfilter path. If the peer list
+  changes while mode is `tc`, the kernel forces `tunnel` until `attach` rebuilds the
+  maps; a stale map cannot silently miss a new peer prefix.
 * `ts_ndo_start_xmit` strips the L2 header a TC redirect carries
   (`skb_network_header - skb->data`, 1..32 bytes). IPv4 arrives with a 14-byte Ethernet
   header; IPv6 arrives already at L3 in this kernel.
@@ -181,18 +185,57 @@ classifier on the underlay's egress:
 **Why the AEAD is not in BPF.** The tunnel needs the synchronous ChaCha20/Poly1305 path;
 BPF helpers cannot call it. TC only classifies and redirects; the device encapsulates.
 
-**Fail-open caveat and mitigation.** Netfilter `POST_ROUTING` runs **before** TC
-egress. In `tc` mode the netfilter egress hook is bypassed (otherwise packets would be
-encapsulated twice), so if the classifier disappears — qdisc deleted, program unloaded,
-wrong netns — peer traffic leaves in the clear. The helper orders attach → mode and
-mode → detach, but that only covers the normal path.
+**Fail-closed guard.** Netfilter `POST_ROUTING` runs **before** TC egress. In `tc`
+mode the netfilter egress hook is bypassed (otherwise packets would be encapsulated
+twice), so relying on the classifier alone would be fail-open if the qdisc or program
+disappeared. The module now registers IPv4/IPv6 `NF_INET_LOCAL_OUT` and
+`NF_INET_FORWARD` hooks, both before `POST_ROUTING`:
 
-`torshield-tc watch -i UNDERLAY [-n MS]` bounds the window: while the mode is `tc` it
-polls the underlay's egress filter and reverts the mode to `tunnel` as soon as the
-`ts_tc_egress` program is gone. Verified with a 200 ms interval: deleting the qdisc
-externally reverted the mode within ~0.5 s (`torshield-tc: classifier missing ...;
-reverting to tunnel`). This is a mitigation, not a fail-closed guarantee; a real
-deployment should run the watcher under systemd and monitor it.
+```
+peer-destined packet
+  output dev = torshield?                  -> allow (ndo_start_xmit encapsulates)
+  output dev has live ts_tc_egress/TCX?    -> allow (TC egress will redirect)
+  otherwise                                -> NF_DROP (+ tc_guard)
+```
+
+The output device comes from `nf_hook_state.out`, not `skb_dst(skb)->dev`: at
+`FORWARD`, `skb_dst()` can still describe the input route. The classifier check
+accepts either a TCX `ts_tc_egress` program in `dev->tcx_egress` or a live
+`cls_bpf` filter in the clsact mini-Qdisc (the style `torshield-tc` uses today).
+The TCX branch is compile-tested only; the runtime tests below exercise the
+clsact path. The BPF program also returns `TC_ACT_SHOT` when a matching peer has
+no `cfg[0]` redirect target, rather than falling through to `TC_ACT_OK`.
+
+The guard only proves that a classifier is attached, so the loader must keep its
+maps complete. `torshield-tc attach` reads every `allowed=` prefix from
+`/proc/torshield/peers` and fills the LPM tries; a missing `-4/-6` cannot omit a
+peer prefix. If a peer is added, deleted or cleared while mode is `tc`, the kernel
+forces `tunnel` until the loader runs again. Direct map edits or a hand-loaded
+classifier are outside this guarantee.
+
+`torshield-tc watch -i UNDERLAY [-n MS]` remains a recovery aid: it polls the
+underlay's egress filter and writes `tunnel` as soon as the program is gone. It is
+not the security boundary any more.
+
+**Verified deletion behaviour** (native 6.18.54.1, `stage24.sh`/`stage25.sh`):
+
+| Check | Result |
+|---|---|
+| Delete classifier on sender, mode `tc` | `sendto` **0 sent / 8 blocked (`EPERM`)**, peer server **0**, `tc_guard +8`, `dev_out +0`, `tun_out +0` |
+| Delete clsact qdisc on sender, mode `tc` | same: **0 sent / 8 blocked**, server **0**, `tc_guard +8`, `dev_out +0`, `tun_out +0` |
+| Restore classifier | echo **16/16**; detach fallback **8/8** |
+| `FORWARD` with no classifier | n2 ingress **8**, n3 outer **0**, `tc_guard +8`, `dev_out +0` |
+| `FORWARD` with classifier | `tc_guard +0`, `dev_out +8`, n3 `tun_rx +8` |
+| `FORWARD` after deletion | n3 outer **0**, `tc_guard +8`, `dev_out +0` |
+| Peer add/del/clear while mode `tc` | each changed the mode to **tunnel** (`peer list changed; mode=tunnel until torshield-tc reattaches`) |
+| Loader auto-fill | n1 attached with **no `-4/-6`**; it reported **2 IPv4, 2 IPv6 prefixes** read from `/proc/torshield/peers`; echo **16/16** |
+
+**Residual race.** The guard and TC egress read the attachment separately. A
+deletion that lands after the guard accepts a packet but before that packet
+reaches TC egress can still release one in-flight packet in clear. The tests
+prove fail-closed behaviour for subsequent packets, not a zero-race guarantee.
+A last-chance `ndo_start_xmit` guard or a single steering point would be needed
+to close it; neither is implemented.
 
 Verified with `stage21.sh` (R37–R40), distinct inner/outer addresses:
 
@@ -221,9 +264,10 @@ native v6 pcap capture is empty in the WSL harness, so the v6 wire evidence rema
 
 ## 6. Next steps
 
-1. Make TC egress **fully** fail closed: the watchdog (`torshield-tc watch`) bounds the
-   window to one poll, but a steering point before `POST_ROUTING` (or a kernel-side
-   classifier-presence check) is still needed for a guarantee.
+1. Close the remaining TC check-to-egress race: the `LOCAL_OUT`/`FORWARD` guard is
+   fail-closed for removals, but a single in-flight packet can pass the guard just
+   before the classifier is deleted. A last-chance `ndo_start_xmit` check or one
+   authoritative steering point would close it.
 2. Advertise GSO/TSO and segment in the driver, then re-measure throughput.
 3. Deliver decapped packets through the tunnel netdevice (`skb->dev = torshield0`) so that
    `rp_filter`, policy routing and per-device counters apply to ingress as well.

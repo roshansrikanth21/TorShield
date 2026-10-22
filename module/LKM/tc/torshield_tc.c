@@ -81,13 +81,29 @@ static __always_inline void count(void *map, __u32 *zero)
 		__sync_fetch_and_add(v, 1);
 }
 
+/*
+ * A matching inner packet must never fall through to the wire.  If the
+ * target device is missing from cfg, the classifier is attached but not
+ * configured; drop rather than returning TC_ACT_OK (which the kernel-side
+ * LOCAL_OUT/FORWARD guard cannot distinguish from a working redirect).
+ */
+static __always_inline int steer(__u32 *zero)
+{
+	__u32 *ifindex = bpf_map_lookup_elem(&cfg, zero);
+
+	if (!ifindex || !*ifindex)
+		return TC_ACT_SHOT;
+	count(&redirects, zero);
+	return bpf_redirect(*ifindex, 0);
+}
+
 SEC("tc")
 int ts_tc_egress(struct __sk_buff *skb)
 {
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 	struct ethhdr *eth = data;
-	__u32 zero = 0, *ifindex;
+	__u32 zero = 0;
 	__u16 proto;
 
 	/* Already encapsulated by the torshield device. */
@@ -95,10 +111,6 @@ int ts_tc_egress(struct __sk_buff *skb)
 		count(&marked, &zero);
 		return TC_ACT_OK;
 	}
-
-	ifindex = bpf_map_lookup_elem(&cfg, &zero);
-	if (!ifindex || !*ifindex)
-		return TC_ACT_OK;
 
 	if ((void *)(eth + 1) > data_end)
 		return TC_ACT_OK;
@@ -122,10 +134,8 @@ int ts_tc_egress(struct __sk_buff *skb)
 			return TC_ACT_OK;
 		key.prefixlen = 32;
 		key.addr = ip->daddr;
-		if (bpf_map_lookup_elem(&allowed4, &key)) {
-			count(&redirects, &zero);
-			return bpf_redirect(*ifindex, 0);
-		}
+		if (bpf_map_lookup_elem(&allowed4, &key))
+			return steer(&zero);
 	} else if (proto == bpf_htons(ETH_P_IPV6)) {
 		struct ipv6hdr *ip6 = (void *)(eth + 1);
 		struct lpm6_key key = {};
@@ -145,10 +155,8 @@ int ts_tc_egress(struct __sk_buff *skb)
 			return TC_ACT_OK;
 		key.prefixlen = 128;
 		__builtin_memcpy(key.addr, &ip6->daddr, sizeof(key.addr));
-		if (bpf_map_lookup_elem(&allowed6, &key)) {
-			count(&redirects, &zero);
-			return bpf_redirect(*ifindex, 0);
-		}
+		if (bpf_map_lookup_elem(&allowed6, &key))
+			return steer(&zero);
 	}
 
 	return TC_ACT_OK;

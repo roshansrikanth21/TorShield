@@ -14,7 +14,7 @@ research/teaching artifact, **not** a replacement for WireGuard, IPsec or TLS.
 |---|---|---|
 | `tunnel` | **default** | Netfilter `POST_ROUTING` encapsulates traffic to configured peers in UDP:4789; `LOCAL_IN` (after IP reassembly) authenticates and re-injects |
 | `hybrid` | opt-in | `torshield0` netdevice (`rtnl_link_ops` kind `torshield`) encapsulates traffic routed into it; netfilter still handles all other peer traffic |
-| `tc` | opt-in | Netfilter egress is bypassed; a clsact/eBPF classifier on the underlay redirects matching inner packets to the same `torshield` device |
+| `tc` | opt-in | Netfilter egress is bypassed; a clsact/eBPF classifier on the underlay redirects matching inner packets to the same `torshield` device. A kernel `LOCAL_OUT`/`FORWARD` guard drops peer packets when the classifier is missing |
 | `stream` | legacy | Length-preserving payload transform, retained for comparison; **no integrity/authentication** |
 
 Tunnel, hybrid and TC share one wire format and interoperate.
@@ -133,26 +133,34 @@ transparent path, so a hybrid peer interoperates with a plain tunnel peer.
 
 ```bash
 # run in the namespace that owns the underlay
-sudo torshield-tc attach -o tc/torshield_tc.o -i eth0 -d torshield0 \
-    -4 10.0.0.1/32 -4 10.0.0.2/32 \
-    -6 fd00::1/128 -6 fd00::2/128
+sudo torshield-tc attach -o tc/torshield_tc.o -i eth0 -d torshield0
 sudo torshield-tc detach -i eth0
 ```
 
-`attach` loads the object, fills the LPM maps, attaches to the underlay's clsact
-egress, and only then writes `tc` to the mode file; `detach` writes `tunnel`
-first and then removes the qdisc. The classifier redirects matching packets to
+`attach` loads the object, reads every `allowed=` prefix from
+`/proc/torshield/peers` (optional `-4`/`-6` add extras), fills the LPM maps,
+attaches to the underlay's clsact egress, and only then writes `tc` to the mode
+file; `detach` writes `tunnel` first and then removes the qdisc. A peer
+add/del/clear while mode is `tc` forces `tunnel` until `attach` is rerun, so a
+stale map cannot omit a new peer prefix. The classifier redirects matching packets to
 the per-namespace `torshield` device (outer frames carry `TS_TC_MARK` so they
 are not redirected twice) and `ndo_start_xmit` strips the L2 header TC supplies.
 Each namespace needs its own attach, because the redirect ifindex is stored per
 classifier instance.
 
-> **Fail-open.** Netfilter `POST_ROUTING` runs before TC egress, so `tc` mode
-> cannot fail closed: if the qdisc or program disappears while the mode is `tc`,
-> peer traffic leaves in the clear. The helper orders attach/mode and
-> mode/detach, and `torshield-tc watch -i DEV` reverts the mode when the
-> classifier disappears; a supervisor is still required. See
-> [`../../TUN-HYBRID.md`](../../TUN-HYBRID.md) §5.
+> **Fail-closed guard.** `tc` mode is guarded in the kernel, not only by the
+> userspace helper. IPv4/IPv6 `NF_INET_LOCAL_OUT` and `NF_INET_FORWARD` hooks run
+> before `POST_ROUTING`; for a peer-destined packet they require the route output
+> device to be a `torshield` device or to still carry the live TC egress
+> classifier (TCX `ts_tc_egress` or a clsact `cls_bpf` filter; TCX is
+> compile-tested only). If it is missing,
+> the packet is dropped and `tc_guard` in `/proc/torshield/stats` increases.
+> `torshield-tc watch` is now a recovery aid that reverts the mode to `tunnel`;
+> it is not the security boundary. The guard trusts a live classifier to have
+> complete maps; the loader closes that gap by reading `/proc/torshield/peers`
+> and the kernel forces `tunnel` when the peer list changes. Direct map edits or
+> hand-loaded classifiers are outside the guarantee. A narrow check-to-egress
+> race remains and is documented in [`../../TUN-HYBRID.md`](../../TUN-HYBRID.md) §5.
 
 ## Known limitations
 
@@ -166,8 +174,11 @@ classifier instance.
 - The peer list, key and mode are global module state shared across namespaces.
 - Cryptokey routing supports distinct inner/outer addresses and endpoint roaming;
   multipath/ECMP is not implemented.
-- TC mode is **fail-open** if the classifier disappears (`POST_ROUTING` precedes
-  TC egress); the AEAD cannot run in BPF and stays in `ndo_start_xmit`.
+- TC mode's `LOCAL_OUT`/`FORWARD` guard is fail-closed against classifier/qdisc
+  removal, but it is a separate read from TC egress. A classifier deleted in the
+  window after the guard accepts a packet but before egress can release that one
+  in-flight packet in clear. The AEAD cannot run in BPF and stays in
+  `ndo_start_xmit`.
 - No PMTU discovery or ICMP relay; TCP MSS is clamped, large UDP relies on
   outer fragmentation/reassembly (verified to 60 KB). The receiver linearizes a
   reassembled skb before the AEAD, so a very large datagram needs a high-order
