@@ -7,6 +7,7 @@
 \usepackage{array}
 \usepackage{graphicx}
 \usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta}
 \usepackage{url}
 \usepackage[hidelinks]{hyperref}
 \hypersetup{
@@ -81,7 +82,30 @@ eBPF and TC allow packet classification and redirection in the kernel \cite{hoil
 \label{sec:design}
 
 \subsection{Overview and Modes}
-\sys{} is a loadable kernel module. It is inert until a key and at least one peer are configured, so loading it does not disrupt a host. Table~\ref{tab:modes} lists the four modes. The default is \code{tunnel}. \code{hybrid} and \code{tc} add alternative egress-steering mechanisms but keep the same wire format and the same Netfilter ingress decapsulation. \code{stream} is the legacy length-preserving transform and is not recommended.
+\sys{} is a loadable kernel module. It is inert until a key and at least one peer are configured, so loading it does not disrupt a host. Fig.~\ref{fig:datapath} shows the shared datapath, and Table~\ref{tab:modes} lists the four modes. The default is \code{tunnel}. \code{hybrid} and \code{tc} add alternative egress-steering mechanisms but keep the same wire format and the same Netfilter ingress decapsulation. \code{stream} is the legacy length-preserving transform and is not recommended.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\scriptsize,>=Latex,node distance=1.5mm,
+  box/.style={draw,rounded corners=1pt,align=center,inner sep=1.5pt,
+              minimum height=4.6mm,text width=32mm},
+  wire/.style={box,fill=black!5,text width=44mm}]
+\node[box] (app) {Application};
+\node[box,below=of app] (stack) {Linux IP stack};
+\node[box,below=of stack,text width=34mm] (egress) {Peer LPM\\ Netfilter $|$ L3 $|$ TC};
+\node[box,below=of egress,text width=34mm] (seal) {AEAD seal\\UDP/4789};
+\node[wire,below=of seal] (wire) {16B header $|$ ciphertext $|$ 16B tag};
+\node[box,below=of wire,text width=34mm] (open) {AEAD open\\replay + ACL};
+\node[box,below=of open] (rstack) {Linux IP stack};
+\node[box,below=of rstack] (rapp) {Application};
+\node[box,right=4mm of egress,text width=24mm,dashed] (guard) {TC guard\\LOCAL\_OUT/\\FORWARD};
+\draw[->,dashed] (guard) -- (egress);
+\foreach \a/\b in {app/stack,stack/egress,egress/seal,seal/wire,wire/open,open/rstack,rstack/rapp}
+  \draw[->] (\a) -- (\b);
+\end{tikzpicture}
+\caption{TorShield v4 datapath. All egress modes share one AEAD wire format; the TC guard drops peer-destined packets when the classifier or qdisc is missing.}
+\label{fig:datapath}
+\end{figure}
 
 \begin{table}[t]
 \centering
@@ -194,26 +218,7 @@ TC detach fallback & mode \code{tunnel}; echo 16/16 \\
 \end{table}
 
 \subsection{Wire-Format Verification}
-Table~\ref{tab:wire} reports independent AEAD acceptance on captured outer packets. The negative controls are important: a capture that authenticates with the per-peer key but not with the global PSK shows that the key identifier and key selection are actually in use. The native IPv6 pcap capture was empty in the WSL2 harness, so the IPv6 wire claim rests on the QEMU 68/68 capture; the native IPv6 functional path was still verified by echo and counters but is not a wire-verification claim.
-
-\begin{table}[t]
-\centering
-\caption{Independent AEAD verification of captured outer frames. ``Wrong key'' means the global PSK was used as the verifier key.}
-\label{tab:wire}
-\footnotesize
-\setlength{\tabcolsep}{3pt}
-\begin{tabular}{@{}lccc@{}}
-\toprule
-Path & Frames & Correct key & Wrong key \\
-\midrule
-Tunnel, IPv4 & 1054 & 1054/1054 & --- \\
-Hybrid, IPv4 & 807 & 807/807 & --- \\
-Hybrid, IPv6 & 209 & 209/209 & --- \\
-TC, IPv4 & 210 & 210/210 & 0/210 \\
-TC, IPv6 (QEMU) & 68 & 68/68 & 0/68 \\
-\bottomrule
-\end{tabular}
-\end{table}
+Independent AEAD verification accepted 1054/1054 tunnel frames, 807/807 hybrid IPv4 frames, 209/209 hybrid IPv6 frames, 210/210 TC IPv4 frames, and 68/68 TC IPv6 frames with the correct key. The TC captures accepted 0/210 and 0/68 when verified with the global PSK, confirming that key selection is actually in use. The native IPv6 pcap capture was empty in the WSL2 harness, so the IPv6 wire claim rests on the QEMU 68/68 capture; native IPv6 was verified functionally by echo and counters.
 
 \subsection{TC Fail-Closed Behaviour}
 Table~\ref{tab:guard} reports the deletion tests. In the \code{LOCAL\_OUT} test, a local socket sends eight packets while the classifier is deleted; all eight fail with \code{EPERM}, the peer server receives zero, \code{tc\_guard} increases by eight, and both \code{dev\_out} and \code{tun\_out} remain unchanged. Deleting the clsact qdisc produces the same result. Reattaching the classifier restores a 16/16 echo; detaching falls back to the Netfilter path at 8/8.
@@ -316,10 +321,7 @@ The negative result about the XOR prototype is also a lesson. A length-preservin
 \section{Conclusion and Future Work}
 \sys{} is a transparent in-kernel authenticated tunnel with three steering paths and a kernel-side fail-closed guard for TC. The current code is byte-exact on IPv4 and IPv6 TCP, survives independent AEAD verification, drops replay/tamper/unknown-source packets, and blocks subsequent local and forwarded packets when the TC classifier is removed. On a native VM it sustains 3.40\,Gbit/s over four streams for 30\,s with flat unreclaimable memory. The paper also reports the defects that the evaluation found and the claims that the earlier XOR draft cannot support.
 
-Future work is concrete: close the guard-to-egress race with a last-chance transmit check or a single steering point; add a handshake and forward secrecy; move the control plane to netlink and make state per-network-namespace; deliver decapsulated packets through the tunnel device so policy routing and \code{rp\_filter} see them; advertise GSO/TSO on the device and segment in the driver; run the deletion suite for IPv6 and the TCX path; and repeat the throughput study on bare metal with a physical NIC. Until then, \sys{} remains a research and teaching artifact, not a production replacement for WireGuard or IPsec.
-
-\section*{Artifact Availability}
-The code and test harness are available at \url{https://github.com/roshansrikanth21/TorShield}. The measurements in this paper correspond to the v4 datapath described in the repository README and the evidence log in \code{TO-DO.md}. The initial XOR draft is preserved under \code{paper/archive/} and is not the system evaluated here.
+Future work is concrete: close the guard-to-egress race with a last-chance transmit check or a single steering point; add a handshake and forward secrecy; move the control plane to netlink and make state per-network-namespace; deliver decapsulated packets through the tunnel device so policy routing and \code{rp\_filter} see them; advertise GSO/TSO on the device and segment in the driver; run the deletion suite for IPv6 and the TCX path; and repeat the throughput study on bare metal with a physical NIC. Until then, \sys{} remains a research and teaching artifact, not a production replacement for WireGuard or IPsec. The code and test harness are available at \url{https://github.com/roshansrikanth21/TorShield}.
 
 \bibliographystyle{IEEEtran}
 \bibliography{references}

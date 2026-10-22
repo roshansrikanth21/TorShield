@@ -44,6 +44,9 @@ not by shrinking the font or margins.
   kernel matrix. See `CLAIM_EVIDENCE.md`.
 - The old manuscript's duplicated code listings, stray line numbers,
   `Table ??`, and figure placeholders are gone.
+- The old XOR architecture diagram and output screenshots are replaced by one
+  compact v4 datapath figure (Fig. 1) showing the shared AEAD wire format and
+  the fail-closed TC guard.
 - The paper now states explicitly that TorShield is not Tor, provides no
   anonymity, has no handshake or forward secrecy, and is not a replacement for
   WireGuard or IPsec.
@@ -57,8 +60,8 @@ not by shrinking the font or margins.
    repository Git configuration and should be confirmed before submission.
 3. Decide whether to add a bare-metal throughput run. The current performance
    numbers are from a WSL2/Hyper-V VM, and the paper says so.
-4. If the venue expects a figure, add a compact architecture diagram; the
-   current manuscript relies on tables and prose.
+4. The manuscript already includes one compact v4 datapath figure (Fig. 1).
+   Do not reuse the old XOR diagrams or the `/proc/xor_key` screenshots.
 5. Rebuild the PDF after any edit and run:
    `grep -nE 'Overfull|Undefined|undefined|Warning' TorShield_IEEE.log`.
 6. Keep `CLAIM_EVIDENCE.md` in sync with any new result. Do not add a number to
