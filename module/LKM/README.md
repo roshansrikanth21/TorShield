@@ -177,7 +177,9 @@ classifier instance.
 - TC mode's `LOCAL_OUT`/`FORWARD` guard is fail-closed against classifier/qdisc
   removal, but it is a separate read from TC egress. A classifier deleted in the
   window after the guard accepts a packet but before egress can release that one
-  in-flight packet in clear. The AEAD cannot run in BPF and stays in
+  in-flight packet in clear. The deletion tests are IPv4-only; the v6 guard
+  builds but has no separate v6 removal test. `attach` and peer changes are not
+  atomic with each other. The AEAD cannot run in BPF and stays in
   `ndo_start_xmit`.
 - No PMTU discovery or ICMP relay; TCP MSS is clamped, large UDP relies on
   outer fragmentation/reassembly (verified to 60 KB). The receiver linearizes a

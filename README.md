@@ -201,7 +201,10 @@ has accepted a packet but before that packet reaches TC egress, the in-flight
 packet can still leave in clear. The deletion tests below prove fail-closed
 behaviour for all subsequent packets; they do not prove a zero-race guarantee.
 A single steering point (or a last-chance xmit hook) would be required for that,
-and is not implemented. See [`TUN-HYBRID.md`](TUN-HYBRID.md) §5.
+and is not implemented. The deletion tests are IPv4; the IPv6 guard hooks build
+but the v6 removal path is not separately runtime-tested. Peer changes and
+`attach` are not one atomic transaction: do not reconfigure peers concurrently
+with `torshield-tc attach`. See [`TUN-HYBRID.md`](TUN-HYBRID.md) §5.
 
 ## Verified results
 

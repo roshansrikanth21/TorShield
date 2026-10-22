@@ -235,7 +235,10 @@ deletion that lands after the guard accepts a packet but before that packet
 reaches TC egress can still release one in-flight packet in clear. The tests
 prove fail-closed behaviour for subsequent packets, not a zero-race guarantee.
 A last-chance `ndo_start_xmit` guard or a single steering point would be needed
-to close it; neither is implemented.
+to close it; neither is implemented. The deletion tests are IPv4; the IPv6 guard
+hooks build on both kernels but the v6 removal path is not separately
+runtime-tested. `attach` and peer changes are not one atomic transaction; do not
+reconfigure peers concurrently with `attach`.
 
 Verified with `stage21.sh` (R37–R40), distinct inner/outer addresses:
 
