@@ -88,6 +88,12 @@ struct ts_prefix {
 	} addr;
 };
 
+/* A 64-packet window is too small once parallel TX queues reorder packets:
+ * a 4-stream 1 Gbps run over veth produced >200 false replay drops.  1024
+ * packets tolerates ~10 ms of reordering at that rate. */
+#define TS_REPLAY_WIN   1024
+#define TS_REPLAY_WORDS (TS_REPLAY_WIN / 64)
+
 struct ts_peer {
 	struct list_head list;
 	u8               family;                  /* endpoint family            */
@@ -102,7 +108,7 @@ struct ts_peer {
 	/* tunnel mode state */
 	atomic64_t       tx_seq;                  /* per-peer packet counter    */
 	u64              rx_last;                 /* replay window (under cfg)  */
-	u64              rx_bitmap;
+	u64              rx_bitmap[TS_REPLAY_WORDS];
 };
 static LIST_HEAD(peer_list);
 
@@ -755,7 +761,26 @@ struct ts_tun_hdr {
 static atomic64_t st_tun_out, st_tun_in, st_tun_drop, st_tun_replay;
 static atomic64_t st_tun_rx, st_tun_peer, st_tun_acl, st_tun_roam;
 static atomic64_t st_dev_out, st_dev_drop;
+static atomic64_t st_tun_rlimit;
 static atomic_t ts_ip_id = ATOMIC_INIT(0);   /* outer IPv4 identification */
+
+/* Cheap pre-AEAD DoS bound: a fixed-window per-source packet counter.  It is
+ * not a cryptographic cookie (the source is spoofable), but it keeps a single
+ * sender from forcing an unbounded number of Poly1305 checks.  Off by default
+ * so that measurements are not capped; enable with ts_rl_pps=N. */
+#define TS_RL_BUCKETS 1024
+struct ts_rl_entry {
+	u8 family;              /* 0 = empty, AF_INET, AF_INET6 */
+	u8 addr[16];
+	u32 count;              /* packets in the current window */
+	unsigned long window;   /* jiffies at window start */
+};
+static struct ts_rl_entry ts_rl[TS_RL_BUCKETS];
+static DEFINE_SPINLOCK(ts_rl_lock);
+static unsigned int ts_rl_pps;  /* packets/second/source; 0 = disabled */
+module_param(ts_rl_pps, uint, 0644);
+MODULE_PARM_DESC(ts_rl_pps, "per-source tunnel packet limit (packets/s, 0=off)");
+
 
 /* ---- little/big-endian helpers (no arch unaligned header needed) ------- */
 static inline u32 ts_le32(const u8 *p)
@@ -1087,33 +1112,50 @@ static bool ts_aead_open(const u8 key[32], const u8 nonce[12],
 }
 
 /* ---- replay window ----------------------------------------------------- */
+/* Shift the window up by `shift` bits (shift < TS_REPLAY_WIN). */
+static void ts_replay_shift(u64 *bm, unsigned int shift)
+{
+	unsigned int words = shift / 64, bits = shift % 64;
+	int i;
+
+	if (words) {
+		for (i = TS_REPLAY_WORDS - 1; i >= (int)words; i--)
+			bm[i] = bm[i - words];
+		for (i = 0; i < (int)words; i++)
+			bm[i] = 0;
+	}
+	if (bits) {
+		for (i = TS_REPLAY_WORDS - 1; i > 0; i--)
+			bm[i] = (bm[i] << bits) | (bm[i - 1] >> (64 - bits));
+		bm[0] <<= bits;
+	}
+}
+
 static bool ts_replay_ok(struct ts_peer *p, u64 seq)
 {
+	u64 diff;
+
 	if (seq == 0)
 		return false;
 
 	if (seq > p->rx_last) {
-		u64 diff = seq - p->rx_last;
-
-		if (diff >= 64)
-			p->rx_bitmap = 0;
+		diff = seq - p->rx_last;
+		if (diff >= TS_REPLAY_WIN)
+			memset(p->rx_bitmap, 0, sizeof(p->rx_bitmap));
 		else
-			p->rx_bitmap <<= diff;
-		p->rx_bitmap |= 1;
+			ts_replay_shift(p->rx_bitmap, (unsigned int)diff);
+		p->rx_bitmap[0] |= 1;
 		p->rx_last = seq;
 		return true;
 	}
 
-	{
-		u64 diff = p->rx_last - seq;
-
-		if (diff >= 64)
-			return false;
-		if (p->rx_bitmap & (1ULL << diff))
-			return false;
-		p->rx_bitmap |= 1ULL << diff;
-		return true;
-	}
+	diff = p->rx_last - seq;
+	if (diff >= TS_REPLAY_WIN)
+		return false;
+	if (p->rx_bitmap[diff / 64] & (1ULL << (diff % 64)))
+		return false;
+	p->rx_bitmap[diff / 64] |= 1ULL << (diff % 64);
+	return true;
 }
 
 static void ts_tun_nonce(__be32 fold, u64 seq, u8 nonce[12])
@@ -1460,6 +1502,69 @@ static void ts_note_nonpeer(struct sk_buff *skb, bool v6, u64 seq)
 				    skb->dev ? skb->dev->name : "?", seq);
 }
 
+static u32 ts_rl_hash(const u8 *addr, int n)
+{
+	u32 h = 2166136261u;
+	int i;
+
+	for (i = 0; i < n; i++) {
+		h ^= addr[i];
+		h *= 16777619u;
+	}
+	return h & (TS_RL_BUCKETS - 1);
+}
+
+/*
+ * Fixed-window per-source limiter, called before linearize/AEAD.  It bounds
+ * the amount of crypto work one source can force; it does not authenticate
+ * the source (spoofing is possible), so it complements, not replaces, a
+ * cryptographic cookie/handshake.
+ */
+static bool ts_ratelimit_ok(struct sk_buff *skb, bool v6)
+{
+	const u8 *src;
+	struct ts_rl_entry *e;
+	unsigned long now = jiffies;
+	u8 family;
+	u32 idx, limit;
+	int alen;
+
+	limit = READ_ONCE(ts_rl_pps);
+	if (!limit)
+		return true;
+	if (v6) {
+		src = (const u8 *)&ipv6_hdr(skb)->saddr;
+		family = AF_INET6;
+		alen = 16;
+	} else {
+		src = (const u8 *)&ip_hdr(skb)->saddr;
+		family = AF_INET;
+		alen = 4;
+	}
+	idx = ts_rl_hash(src, alen);
+
+	spin_lock(&ts_rl_lock);
+	e = &ts_rl[idx];
+	if (e->family != family || memcmp(e->addr, src, alen)) {
+		e->family = family;
+		memset(e->addr, 0, sizeof(e->addr));
+		memcpy(e->addr, src, alen);
+		e->count = 0;
+		e->window = now;
+	}
+	if (time_after_eq(now, e->window + HZ)) {
+		e->window = now;
+		e->count = 0;
+	}
+	if (e->count >= limit) {
+		spin_unlock(&ts_rl_lock);
+		return false;
+	}
+	e->count++;
+	spin_unlock(&ts_rl_lock);
+	return true;
+}
+
 static unsigned int ts_tun_decap(struct sk_buff *skb, bool outer_v6,
 				 struct udphdr *uh, unsigned int l4_len)
 {
@@ -1487,6 +1592,12 @@ static unsigned int ts_tun_decap(struct sk_buff *skb, bool outer_v6,
 		return NF_ACCEPT;       /* not ours */
 
 	atomic64_inc(&st_tun_rx);
+
+	/* Bound the crypto work an unauthenticated source can force. */
+	if (!ts_ratelimit_ok(skb, outer_v6)) {
+		atomic64_inc(&st_tun_rlimit);
+		return NF_DROP;
+	}
 
 	ct_len = l4_len - sizeof(*uh) - TS_TUN_HDR_LEN - TS_TUN_TAG_LEN;
 	if (ct_len < 16 || (ct_len & 15)) {
@@ -1780,6 +1891,11 @@ static unsigned int ts_tun_out(struct sk_buff *skb, bool v6)
 			if (err) {
 				atomic64_inc(&st_tun_drop);
 				kfree_skb(seg);
+			} else {
+				/* The segment was copied into the outer skb;
+				 * release it or sustained GSO traffic drains
+				 * slab memory. */
+				consume_skb(seg);
 			}
 		}
 		seg = next;
@@ -2459,6 +2575,7 @@ static int stats_show(struct seq_file *m, void *v)
 		   (long long)atomic64_read(&st_tun_replay));
 	seq_printf(m, "tun_acl   %lld\n", (long long)atomic64_read(&st_tun_acl));
 	seq_printf(m, "tun_roam  %lld\n", (long long)atomic64_read(&st_tun_roam));
+	seq_printf(m, "tun_rlimit %lld\n", (long long)atomic64_read(&st_tun_rlimit));
 	seq_printf(m, "dev_out   %lld\n", (long long)atomic64_read(&st_dev_out));
 	seq_printf(m, "dev_drop  %lld\n", (long long)atomic64_read(&st_dev_drop));
 	return 0;

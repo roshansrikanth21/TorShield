@@ -26,7 +26,7 @@ Tunnel, hybrid and TC share one wire format and interoperate.
 - ChaCha20-Poly1305 (RFC 7539) confidentiality **and** integrity per packet.
 - Padding to 64-byte buckets, so ciphertext length leaks less than plaintext length.
 - A 64-bit per-peer sequence number, used as the AEAD nonce and checked against a
-  64-packet replay window **after** authentication.
+  **1024-packet** replay window **after** authentication.
 - Fail-closed behaviour in tunnel and hybrid modes: malformed, unauthenticated,
   replayed or unknown-source packets are dropped and counted, never forwarded.
   TC mode depends on the classifier being attached; see the warning below.
@@ -39,7 +39,9 @@ Tunnel, hybrid and TC share one wire format and interoperate.
 - No PMTU discovery/ICMP relay. TCP MSS is clamped (1360 v4 / 1340 v6); large UDP
   datagrams rely on outer IP fragmentation and reassembly.
 - No per-namespace configuration: the key, peer list and mode are global.
-- No DoS hardening: an arbitrary source can make the receiver run a Poly1305 check.
+- Limited DoS resistance only: an optional per-source fixed-window limiter
+  (`ts_rl_pps`, off by default) can reject packets before `skb_linearize`/Poly1305;
+  there is no cookie challenge.
 
 For real-world privacy use WireGuard or IPsec. This is a research/teaching
 implementation and a measurement vehicle.
@@ -143,15 +145,48 @@ per-namespace).
 > **Fail-open warning.** Netfilter `POST_ROUTING` runs before TC egress, so `tc` mode
 > bypasses the netfilter encap and relies entirely on the classifier. If the qdisc or
 > program disappears while mode is `tc` (for example `tc qdisc del`, a module reload,
-> or attaching in the wrong namespace), peer traffic can leave **in the clear**. Use a
-> supervisor, and never treat `tc` mode as fail-closed. See
+> or attaching in the wrong namespace), peer traffic can leave **in the clear**.
+> Run `torshield-tc watch -i eth0 -n 1000` under a supervisor: it polls the egress
+> filter and reverts the mode to `tunnel` when the classifier disappears (verified
+> to revert within ~0.5 s at a 200 ms interval). It is a bounded mitigation, not a
+> fail-closed guarantee — never treat `tc` mode as fail-closed. See
 > [`TUN-HYBRID.md`](TUN-HYBRID.md) §5.
 
 ## Verified results
 
-Environment: Ubuntu 24.04, kernel `6.8.0-147-generic`, QEMU 8.2 with TCG
-(no KVM). These are correctness results on emulated hardware; no paper-grade
-throughput numbers have been measured yet.
+Environment for the correctness table: Ubuntu 24.04, kernel `6.8.0-147-generic`,
+QEMU 8.2 with TCG (no KVM). Throughput was measured separately on the native
+kernel, because TCG CPU emulation is not a throughput measurement.
+
+### Native measurements (WSL2, kernel 6.18.54.1)
+
+Native build: WSL2 `6.18.54.1-microsoft-standard-WSL2`, module built against the
+full in-tree `Module.symvers` (vermagic match, `libchacha` auto-loaded). This is
+a Hyper-V VM with 16 vCPUs, **not bare metal**; the direct-veth baseline shows
+the link is not the bottleneck.
+
+| Test | Result |
+|---|---|
+| Baseline, direct veth, 4-stream TCP, 3 runs | **100.98 / 99.76 / 97.84 Gbit/s** |
+| Tunnel, 1-stream TCP, 3 runs | **909.7 / 921.5 / 965.4 Mbit/s**, 0 retransmits |
+| Tunnel, 4-stream TCP, 3 runs | **3345.6 / 3018.1 / 3203.1 Mbit/s**, ≤3 retransmits |
+| Tunnel, 30 s sustained 4-stream TCP | **3.40 Gbit/s**; `SUnreclaim` flat at **63–68 MB**; no panic; `tun_drop 0`, `tun_replay 0` |
+| Tunnel RTT, 100 pings | **0.052 ms avg** (baseline 0.067 ms) |
+| Tunnel v4/v6 UDP echo | **256/256** and **64/64** |
+| Native stages 16/17/20 | v4/v6 **100%**; replay **1**, tamper drop **1**, ACL **1**, unknown peer **1** (exact) |
+| Native TC, v4/v6 echo | **256/256**, **64/64**; `dev_out 647`, `tun_out 0`, `tun_drop 0`, `dev_drop 0`; detach fallback **16/16** |
+| Native TC wire, v4 | **210/210** authenticated with `K`, **0/210** with the global PSK |
+
+Two issues were exposed only by sustained native load and are fixed:
+
+* **GSO skb leak.** The egress GSO loop copied each segment into the outer skb but
+  never freed the original segment. A 30 s 4-stream run drove
+  `slab_unreclaimable` to ~7.4 GB and panicked the VM. The missing
+  `consume_skb(seg)` is added; the same 30 s run now holds `SUnreclaim` at
+  63–68 MB and completes at 3.40 Gbit/s.
+* **Replay window too narrow.** 4-stream traffic reordered beyond a 64-packet
+  window, producing 229 false replay drops and TCP retransmits. The window is now
+  **1024 packets**; the same 4-stream run records **0** replays and no retransmits.
 
 | Test | Result |
 |---|---|
@@ -169,6 +204,8 @@ throughput numbers have been measured yet.
 | TC, IPv6 UDP echo 64 KB | **64/64**, retries 0; `dev_out 647`, `tun_out 0`, `tun_acl 0`, drops 0 |
 | TC, independent AEAD on the wire | v4 **210/210** with `K`, **0/210** with the global PSK; v6 **68/68** with `K6`, **0/68** with the PSK |
 | TC, detach fallback | mode returns to `tunnel`; netfilter echo **16/16**, `tun_out +32` |
+| Per-source rate limiter (`ts_rl_pps=50`) | **950/1000** stopped before the AEAD, **50** reached it; legitimate echo **64/64** |
+| TC watchdog | external `tc qdisc del` reverted mode to `tunnel` within **~0.5 s** (200 ms poll) |
 | `make W=1` | clean on 6.8.0-147 and 6.17.0-42 |
 
 Several real defects were found by these tests and fixed: the decap read only the

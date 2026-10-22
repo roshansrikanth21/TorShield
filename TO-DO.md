@@ -15,18 +15,21 @@ Claims are labelled `BUILD-VERIFIED`, `RUNTIME-VERIFIED`, or `STATIC-ONLY`.
 | Area | State |
 |---|---|
 | Build matrix (6.8 LTS + 6.17 HWE, `W=1`) | **DONE** — clean |
-| Real-kernel test environment | **DONE** — QEMU Ubuntu 24.04, kernel 6.8.0-147 |
+| Real-kernel test environment | **DONE** — QEMU Ubuntu 24.04 (6.8.0-147) + native WSL2 6.18.54.1 |
 | **D1: datapath** | **RESOLVED — option B (UDP tunnel)**, now the default mode |
 | Stream mode (legacy, opt-in) | **DONE** — TCP/UDP v4+v6 integrity verified; no AEAD by construction |
-| **Tunnel mode: AEAD + padding + seq + replay** | **DONE** — ChaCha20-Poly1305, 64-byte buckets, 64-packet window |
+| **Tunnel mode: AEAD + padding + seq + replay** | **DONE** — ChaCha20-Poly1305, 64-byte buckets, **1024-packet** window |
 | Tunnel integrity (v4 1 MB, v6 256 KB) | **DONE** — 100% byte-exact, independent AEAD verification |
 | Tunnel replay / tamper / non-peer | **DONE** — all dropped, counters exact |
 | Tunnel control plane | **DONE (procfs)** — mode, key, peers, stats |
 | Hybrid TUN networking | **DONE (prototype)** — `torshield0` netdevice, v4 + v6 verified |
 | Cryptokey routing | **DONE (prototype)** — per-peer keys, allowed prefixes, endpoint roaming |
 | TC clsact/eBPF egress (`tc` mode) | **DONE (prototype)** — LPM redirect to `torshield0`, v4 + v6 verified |
+| Native throughput (WSL2 6.18.54.1) | **DONE** — 1-stream 910–965 Mbit/s, 4-stream 3.02–3.35 Gbit/s, 30 s at 3.40 Gbit/s |
+| DoS rate limiter | **DONE** — per-source fixed window before the AEAD; off by default |
 | Docs (README + module README + CONTEXT) | **DONE** — rewritten to v4, false claims withdrawn |
-| CI, threat model, paper | **TODO** (P2/P3) |
+| CI build (Ubuntu 24.04, module + TC) | **DONE** — `.github/workflows/build.yml` |
+| Threat model, paper | **TODO** (P2/P3) |
 
 **Critical correction to earlier claims:** before this session the module silently left bulk
 TCP **unencrypted** (GSO path) or, with TSO off, **corrupted 98.8% of the stream**. Both are
@@ -62,9 +65,11 @@ Confirmed by testing: 6.8.0-147 (Ubuntu 24.04 LTS) and 6.17.0-42 (HWE). Mainline
 checks are possible too. Tell me if the college machines run something else.
 
 ### D3 — Test host
-Built and working: QEMU (TCG, no KVM) Ubuntu 24.04 inside WSL2, SSH on `127.0.0.1:2222`.
-No root, no VirtualBox login needed. Numbers from it are **relative only** (emulated CPU);
-real-hardware numbers still need a physical/VM host with KVM.
+Correctness runs in QEMU (TCG, no KVM) Ubuntu 24.04 inside WSL2, SSH on
+`127.0.0.1:2222`. Throughput runs natively on WSL2 kernel `6.18.54.1-microsoft-standard-WSL2`
+(Hyper-V VM, 16 vCPUs) — still not bare metal, but the direct-veth baseline is
+98–101 Gbit/s and the numbers are stable across runs. Numbers from QEMU remain
+**relative only** (emulated CPU).
 
 ### D4 — Paper framing
 Confirm the measurement-study framing (`CONTEXT.md`). The old numbers must be withdrawn.
@@ -119,15 +124,18 @@ Legacy `original_repo` builds on 6.8 but not on ≥6.15 (`del_timer` removed). K
 `register_pernet_subsys`): IPv4/IPv6 × PRE_ROUTING/POST_ROUTING/LOCAL_IN.
 
 * **Egress** — `NF_INET_POST_ROUTING` (last): if the destination is a configured peer, the
-  packet is stolen, fragmented (GSO) per segment, padded, encrypted, wrapped in UDP:4789 and
+  packet is stolen, segmented (GSO) per segment, padded, encrypted, wrapped in UDP:4789 and
   sent with `ip_local_out`/`ip6_local_out`. Outer packets are recognised by port and skip the
-  hook (no recursion).
+  hook (no recursion). Each GSO segment is released after it has been copied into the outer skb.
 * **Ingress** — `NF_INET_LOCAL_IN` (first, after IP reassembly): parse header, look up the peer
   by source address, verify AEAD, check replay window, decrypt, re-inject with `netif_rx`
   (`skb->mark = TS_TUN_MARK`).
 * **Fail-closed**: any error in tunnel mode drops the packet, unlike stream mode (fail-open).
 * **MSS clamp**: 1360 (v4) / 1340 (v6) so the outer packet never exceeds 1500.
-* **Replay window**: 64 packets per peer, advanced **after** successful authentication.
+* **Replay window**: 1024 packets per peer, advanced **after** successful authentication. A
+  64-packet window produced 229 false replay drops on 4-stream native traffic; 1024 fixed it.
+* **DoS rate limiter**: optional per-source fixed-window limit (`ts_rl_pps`, default 0 = off)
+  before `skb_linearize`/Poly1305; over-limit packets increment `tun_rlimit`.
 * **Link scope guard**: IPv6 link-local/site-local/loopback and IPv4 169.254/127 sources are
   never tunneled (they are link-scoped; tunneling them is meaningless).
 
@@ -141,13 +149,16 @@ Legacy `original_repo` builds on 6.8 but not on ≥6.15 (`del_timer` removed). K
 | D2.4 | 3 packets/run dropped as non-peer (`fe80::…`) | IPv6 neighbour advertisements to a peer address were encapsulated | Never tunnel link-local/site-local/loopback sources |
 | D2.5 | Every **fragmented** outer datagram failed authentication (`tun_drop`, AEAD fail with correct lengths) | After IP reassembly the skb is a `frag_list`; the decap read the ciphertext through a raw pointer into the linear head only | `skb_linearize()` before the AEAD, then re-derive the header/ciphertext pointers |
 | D2.6 | All outer datagrams carried IPv4 **ID 0** | Encapsulation zeroed the header and never assigned an ID | Per-packet ID from a module counter |
+| D2.7 | Sustained native 4-stream traffic exhausted memory and panicked the VM (`slab_unreclaimable` ~7.4 GB) | GSO egress copied every segment into an outer skb but never freed the original `seg` | `consume_skb(seg)` after a successful encapsulation; 30 s run now flat at 63–68 MB |
+| D2.8 | 4-stream native traffic counted 229 false replays and retransmitted | 64-packet anti-replay window smaller than the reordering across parallel veth queues | Window widened to 1024 packets; 0 replays on the same run |
 
 **Known limits of tunnel mode (honest list).** No rekeying or key rotation; no handshake or
-cookie/DoS protection (any source can make the receiver do a Poly1305 check); the peer list is
-global across netns; no PMTU discovery/ICMP relay; single shared PSK. Large inner UDP datagrams
-rely on outer IP fragmentation and reassembly, which is verified up to 60 KB; the receiver
-linearizes the reassembled skb before the AEAD, so a very large datagram needs a high-order
-atomic allocation and is dropped if that fails.
+forward secrecy. The optional per-source rate limiter (`ts_rl_pps`) bounds pre-AEAD work but
+is a fixed-window filter, not a cookie challenge, and is off by default. The peer list is
+global across netns; no PMTU discovery/ICMP relay. Large inner UDP datagrams rely on outer IP
+fragmentation and reassembly, verified up to 60 KB; the receiver linearizes the reassembled skb
+before the AEAD, so a very large datagram needs a high-order atomic allocation and is dropped if
+that fails.
 
 ---
 
@@ -155,10 +166,10 @@ atomic allocation and is dropped if that fails.
 
 ### P2 — Crypto & architecture
 - [x] AEAD + tags — ChaCha20-Poly1305, tunnel mode (R24)
-- [x] Per-packet sequence + 64-packet replay window (R25)
+- [x] Per-packet sequence + 1024-packet replay window (R25, R46)
 - [ ] Per-flow key derivation (HKDF) from a master secret
 - [ ] Rekeying / key rotation and a handshake (currently one static PSK, no forward secrecy)
-- [ ] DoS hardening: cheap cookie/rate limit before the Poly1305 check on decap
+- [x] DoS hardening: per-source rate limit before `skb_linearize`/Poly1305 (R44)
 - [ ] Length-preserving MAC alternative for stream mode, or explicitly drop its integrity claim
 - [ ] Fix TCP seq wrap in stream mode (rekey per flow at ~2 GB, or counter-based nonce)
 
@@ -182,8 +193,10 @@ atomic allocation and is dropped if that fails.
 - [x] Full L2 frame delivered by a TC redirect is stripped in `ndo_start_xmit`; AEAD stays in
       the kernel device path, not in BPF (R37/R38)
 - [x] Independent AEAD verification of TC-path captures, per-peer keys vs global PSK (R39)
-- [ ] Fail-closed TC egress: POST_ROUTING runs before TC, so a missing/unloaded classifier
-      leaks peer traffic in the clear; needs a supervisor or a pre-TC drop design
+- [x] Fail-safe supervisor: `torshield-tc watch` polls the egress filter and reverts the mode
+      to `tunnel` when the classifier disappears (R42)
+- [ ] True fail-closed steering at a point before `POST_ROUTING`; TC egress cannot provide it
+      by construction (the watchdog only bounds the window to one poll)
 - [ ] Per-netns map lifecycle and pinned statistics (the loader currently owns the maps)
 - [ ] Offload/segmentation tuning for the TC path
 
@@ -191,12 +204,14 @@ atomic allocation and is dropped if that fails.
 - [ ] Netlink control plane (replace procfs), kill switch, safe mode, dry-run
 - [ ] netns integration harness committed to the repo (currently in `.work/vm-src/`)
 - [ ] KUnit tests for length/parse arithmetic
-- [ ] CI matrix (Ubuntu 22.04/24.04, Fedora, 6.8/6.17) + sparse/smatch
+- [x] CI build on Ubuntu 24.04: module with `W=1` + TC object/loader
+- [ ] Broader CI matrix (Ubuntu 22.04, Fedora) + sparse/smatch
 - [ ] Bypass list (loopback, multicast, DHCP, mDNS, NTP)
 - [ ] Per-interface / per-netns policy
 - [x] README rewrite (v4 tunnel/hybrid, verified results, limits) + withdraw the false claims
 - [ ] Threat model + SECURITY.md
-- [ ] Real-hardware throughput (KVM or physical), with and without GSO
+- [x] Native throughput on WSL2 6.18.54.1 (1-stream 910–965 Mbit/s, 4-stream 3.02–3.35 Gbit/s)
+- [ ] Bare-metal / KVM throughput, with and without GSO
 - [ ] `torshield_testbed.sh` still embeds the **v2** SipHash module — do not use it for paper numbers
 
 ---
@@ -249,6 +264,15 @@ Environment: Ubuntu 24.04 cloud image, kernel `6.8.0-147-generic`, QEMU 8.2 TCG 
 | R39 | Independent AEAD on TC-path captures (`t21a` v4, `t21b` v6) | v4 **210/210** with `K`, **0/210** with the global PSK; v6 **68/68** with `K6`, **0/68** with the global PSK; outer `10.0.1.1→10.0.1.2` / `fd01::1→fd01::2`, inner `10.0.0.1→10.0.0.2` / `fd00::1→fd00::2` |
 | R40 | TC detach fallback | `torshield-tc detach` returns mode to `tunnel`; netfilter echo **16/16**, `tun_out +32`, `dev_out` unchanged |
 | R41 | Legacy regression on the final module (stages 16–20) + `W=1` build matrix | stage16 v4/v6 **100%** with exact replay/tamper counters; stage17 interop exact; stage18 hybrid **100%**, `dev_out 1021`, `dev_drop 0`; stage19 4000/60000-byte UDP **100%**; stage20 v4/v6 **256/256**, **64/64**; both 6.8.0-147 and 6.17.0-42 build clean with `W=1` |
+| R42 | TC watchdog (`torshield-tc watch`) | With a 200 ms poll, deleting the clsact qdisc externally reverted `/proc/torshield/mode` to `tunnel` within ~0.5 s; the watcher logged `classifier missing ...; reverting to tunnel` and exited 0 with `-x` |
+| R43 | Native module build/load, WSL2 `6.18.54.1-microsoft-standard-WSL2` | Built against the full in-tree `Module.symvers`; vermagic matches; `modprobe` rc=0; `libchacha` auto-loaded; mode `tunnel` |
+| R44 | Per-source rate limiter (`ts_rl_pps`), native stage22 | Off: all **1000** packets reached the AEAD (`tun_rx 1000`, `tun_drop 1000`, `tun_rlimit 0`); at 50 pps: **950** stopped by the limiter (`tun_rlimit 950`, only 50 reached the AEAD); legitimate echo **64/64** |
+| R45 | Native TC egress (stage21) after the leak fix | v4 **256/256**, v6 **64/64**, retries 0; `dev_out 647`, `tun_out 0`, `tun_in 647`, `tun_acl 0`, `tun_drop 0`, `dev_drop 0`; detach fallback **16/16**, `tun_out +32` |
+| R46 | Replay window: 64 vs 1024 packets, 4-stream native TCP | 64-packet window: **229** false replays, **890 Mbit/s**, 107 retransmits; 1024-packet window: **0 replays**, **1.62 Gbit/s** on the same harness (later clean series 3.0–3.35 Gbit/s) |
+| R47 | Sustained tunnel leak: 30 s 4-stream, before/after fix | Before: `slab_unreclaimable` reached **1,932,757 pages (~7.4 GB)**, `warn_alloc`, VM panic/reboot. Root cause: GSO egress never freed the original segment after copying it. After `consume_skb(seg)`: **3.40 Gbit/s** for 30 s; `SUnreclaim` **63–68 MB**, flat; no panic; `tun_drop 0`, `tun_replay 0` |
+| R48 | Native core regression on 6.18.54.1 | Tunnel v4 **256/256**, v6 **64/64**; stages 16/17/20: TCP **100%**, replay **1**, tamper drop **1**, unknown peer **1**, ACL **1**; TC detach fallback **16/16** |
+| R49 | Native throughput series, final module, 3 runs each | Baseline 4-stream **100.98 / 99.76 / 97.84 Gbit/s**; tunnel 1-stream **909.7 / 921.5 / 965.4 Mbit/s**; tunnel 4-stream **3345.6 / 3018.1 / 3203.1 Mbit/s**; RTT **0.052 ms** avg; `tun_drop 0`, `tun_replay 0` |
+| R50 | Native TC wire verification | v4 capture **210/210** authenticated with `K`, **0/210** with the global PSK, outer `10.0.1.1→10.0.1.2`. Native **v6** pcap capture is empty in this WSL harness (`-i any` shows the outer packet on `eth0`, `-Q in -i veth2` sees none), so the v6 wire claim remains the QEMU **68/68** result (R39), not a native claim |
 
 > R19/R20 are **not paper-grade**: TCG-emulated CPU. They show the direction and the overhead
 > source (per-byte software ChaCha20 + linearise), not real-hardware numbers.
@@ -263,9 +287,16 @@ WSL2 (no root) ── QEMU 8.2 TCG ── Ubuntu 24.04, 6.8.0-147-generic
    ├─ ~/kernels/{6.8.0-147,6.17.0-42}  ├─ /home/ts/ts  (module source)
    ├─ ~/qemu/root                      ├─ netns n1/n2 + veth pair
    └─ ~/vm/noble.img                   └─ tcpdump + pcap.py analysis
+
+WSL2 native ── 6.18.54.1-microsoft-standard-WSL2 (Hyper-V, 16 vCPU)
+   ├─ /root/ts (module source), /root/wsl-kernel (full Module.symvers)
+   └─ netns n1/n2 + veth, iperf3, tcpdump
 ```
 
 * Build: `.work/rebuild.sh` (both kernels), `.work/build-w1.sh`.
+* Native WSL2 build: `.work/build-native.sh` (`KDIR=/root/wsl-kernel`); load: `.work/load-native.sh`.
+* Native tests: `.work/native-bench.sh`, `.work/stress-leak.sh`, `.work/native-rtt.sh`,
+  `.work/native-legacy2.sh`, `.work/native-stages.sh`, `.work/native-tc-verify.sh`.
 * VM: `.work/launch-vm.sh`, SSH `ssh -p 2222 ts@127.0.0.1`.
 * Stream-mode tests: `.work/vm-src/stage{1..15}.sh`, pcap analyser `.work/vm-src/pcap.py`.
 * Tunnel tests: `.work/vm-src/stage16.sh` (acceptance: build, load, TCP v4/v6, UDP,
@@ -285,13 +316,17 @@ WSL2 (no root) ── QEMU 8.2 TCG ── Ubuntu 24.04, 6.8.0-147-generic
 **Tunnel mode (default):**
 
 1. **Static single PSK** — no handshake, no rekeying, no forward secrecy.
-2. **No DoS protection** — every framed packet costs a Poly1305 verification before the replay
-   check, so an off-path sender can force crypto work.
+2. **Limited DoS protection** — every framed packet still costs a Poly1305 verification unless
+   the optional per-source fixed-window limiter (`ts_rl_pps`) is enabled; there is no cookie
+   challenge, and the limiter is off by default so throughput tests are not capped.
 3. **Peer = IP address only**, and one peer list is shared by every network namespace.
 4. **No PMTU discovery or ICMP relay.** Inner TCP is MSS-clamped; large inner UDP datagrams rely
    on outer IP fragmentation and reassembly, verified to 60 KB (R32/R33).
 5. **Outer UDP checksum is 0 over IPv4** (legal; integrity comes from the AEAD tag).
-6. **Throughput** measured only on emulated hardware (TCG).
+6. **Throughput** is measured on a Hyper-V/WSL2 VM, not bare metal. The direct-veth baseline is
+   98–101 Gbit/s; the tunnel is CPU-bound at 0.91–0.97 Gbit/s single-stream and 3.0–3.35 Gbit/s
+   with four streams. The 64-packet replay window was insufficient for that reordering and is
+   now 1024 packets (D2.8).
 
 **Stream mode (opt-in, legacy):**
 
@@ -304,7 +339,7 @@ WSL2 (no root) ── QEMU 8.2 TCG ── Ubuntu 24.04, 6.8.0-147-generic
 **Both modes:**
 
 11. Control plane is procfs, not netlink; no kill switch/dry-run/safe mode.
-12. No real-hardware throughput numbers yet.
+12. Throughput is native VM (WSL2/Hyper-V), not bare metal; QEMU numbers are correctness-only.
 
 **Hybrid (TUN netdevice) prototype — see `TUN-HYBRID.md`:**
 
@@ -318,9 +353,9 @@ WSL2 (no root) ── QEMU 8.2 TCG ── Ubuntu 24.04, 6.8.0-147-generic
 
 16. **Fail-open if the classifier disappears.** `POST_ROUTING` runs before TC egress, so the
     kernel cannot both let TC steer and fail closed. `torshield-tc` attaches before switching
-    to `tc` and reverts to `tunnel` before detaching, but an external `tc qdisc del` or an
-    unloaded program while mode is `tc` sends peer traffic in the clear. A supervisor is
-    required in any real deployment.
+    to `tc` and reverts to `tunnel` before detaching, and `torshield-tc watch` bounds the
+    window to one poll (R42); a genuinely fail-closed deployment still needs a steering point
+    before `POST_ROUTING` or a kernel-side classifier check.
 17. Ingress is still the netfilter `LOCAL_IN` decap; only egress is classified by TC.
 18. BPF only classifies and redirects; the AEAD runs in `ndo_start_xmit` because the BPF helper
     set cannot call the synchronous ChaCha20/Poly1305 path.

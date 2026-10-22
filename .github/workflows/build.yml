@@ -1,0 +1,30 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  module:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential linux-headers-generic \
+            clang llvm libbpf-dev libelf-dev zlib1g-dev
+
+      - name: Build kernel module (W=1)
+        run: |
+          KDIR=$(ls -d /usr/src/linux-headers-*-generic | head -1)
+          echo "KDIR=$KDIR"
+          make -C module/LKM KDIR="$KDIR" W=1
+
+      - name: Build TC classifier and loader
+        run: |
+          make -C module/LKM/tc
+          ls -l module/LKM/tc/torshield_tc.o module/LKM/tc/torshield-tc

@@ -15,9 +15,11 @@
  * back to the netfilter tunnel path before the classifier disappears.
  */
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <getopt.h>
 #include <net/if.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,13 +54,114 @@ static struct prefix4 p4[MAX_PREFIXES];
 static struct prefix6 p6[MAX_PREFIXES];
 static int n4, n6;
 
+static int set_mode(const char *path, const char *mode);
+
 static void usage(const char *prog)
 {
 	fprintf(stderr,
 		"usage: %s attach|detach -i UNDERLAY -d TORSHIELD_DEV\n"
 		"       [-o OBJECT] [-4 CIDR]... [-6 CIDR]...\n"
-		"       [-m MODE_FILE]\n",
-		prog);
+		"       [-m MODE_FILE]\n"
+		"       %s watch -i UNDERLAY [-m MODE_FILE] [-n INTERVAL_MS] [-x]\n",
+		prog, prog);
+}
+
+static bool valid_ifname(const char *s)
+{
+	size_t i, n = strlen(s);
+
+	if (!n || n >= IFNAMSIZ)
+		return false;
+	for (i = 0; i < n; i++) {
+		unsigned char c = (unsigned char)s[i];
+
+		if (!isalnum(c) && c != '.' && c != '_' && c != '-')
+			return false;
+	}
+	return true;
+}
+
+static int read_mode(const char *path, char *buf, size_t len)
+{
+	FILE *f = fopen(path, "r");
+
+	if (!f)
+		return -1;
+	if (!fgets(buf, (int)len, f)) {
+		fclose(f);
+		return -1;
+	}
+	fclose(f);
+	buf[strcspn(buf, "\r\n")] = '\0';
+	return 0;
+}
+
+static bool tc_filter_present(const char *ifname)
+{
+	char cmd[256], line[512];
+	bool found = false;
+	FILE *p;
+
+	if (snprintf(cmd, sizeof(cmd), "tc filter show dev %s egress 2>/dev/null",
+		     ifname) >= (int)sizeof(cmd))
+		return false;
+	p = popen(cmd, "r");
+	if (!p)
+		return false;
+	while (fgets(line, sizeof(line), p)) {
+		if (strstr(line, "ts_tc_egress")) {
+			found = true;
+			break;
+		}
+	}
+	pclose(p);
+	return found;
+}
+
+static volatile sig_atomic_t stop;
+
+static void on_signal(int sig)
+{
+	(void)sig;
+	stop = 1;
+}
+
+/*
+ * The kernel cannot fail closed at TC: POST_ROUTING runs before TC egress, so
+ * tc mode bypasses the netfilter encap and relies on the classifier.  This
+ * watchdog bounds that window: while the mode is "tc" it checks that the
+ * classifier is still on the underlay and reverts to "tunnel" (netfilter
+ * encapsulation) if it is not.  It is not a substitute for a real supervisor,
+ * but it makes an accidental qdisc/filter removal fail safe within one poll.
+ */
+static int run_watch(const char *ifname, const char *mode_path,
+		     int interval_ms, bool exit_after)
+{
+	char mode[32];
+	struct sigaction sa;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = on_signal;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+
+	fprintf(stderr, "torshield-tc: watching %s egress every %d ms\n",
+		ifname, interval_ms);
+	while (!stop) {
+		if (!read_mode(mode_path, mode, sizeof(mode)) &&
+		    !strcmp(mode, "tc") && !tc_filter_present(ifname)) {
+			fprintf(stderr,
+				"torshield-tc: classifier missing on %s while mode=tc; reverting to tunnel\n",
+				ifname);
+			if (set_mode(mode_path, "tunnel"))
+				return 1;
+			if (exit_after)
+				return 0;
+		}
+		usleep((useconds_t)interval_ms * 1000);
+	}
+	return 0;
 }
 
 static int parse_prefix(const char *s, int family)
@@ -130,23 +233,27 @@ int main(int argc, char **argv)
 	int underlay_ifindex, ts_ifindex;
 	__u32 zero = 0;
 	int err, opt, i;
-	bool attach;
+	int interval_ms = 1000;
+	bool exit_after = false;
+	enum { OP_ATTACH, OP_DETACH, OP_WATCH } op;
 
 	if (argc < 2) {
 		usage(argv[0]);
 		return 2;
 	}
 	if (!strcmp(argv[1], "attach"))
-		attach = true;
+		op = OP_ATTACH;
 	else if (!strcmp(argv[1], "detach"))
-		attach = false;
+		op = OP_DETACH;
+	else if (!strcmp(argv[1], "watch"))
+		op = OP_WATCH;
 	else {
 		usage(argv[0]);
 		return 2;
 	}
 	optind = 2;
 	underlay = tsdev = NULL;
-	while ((opt = getopt(argc, argv, "i:d:o:4:6:m:")) != -1) {
+	while ((opt = getopt(argc, argv, "i:d:o:4:6:m:n:x")) != -1) {
 		switch (opt) {
 		case 'i':
 			underlay = optarg;
@@ -159,6 +266,14 @@ int main(int argc, char **argv)
 			break;
 		case 'm':
 			mode_path = optarg;
+			break;
+		case 'n':
+			interval_ms = atoi(optarg);
+			if (interval_ms < 50)
+				interval_ms = 50;
+			break;
+		case 'x':
+			exit_after = true;
 			break;
 		case '4':
 			if (parse_prefix(optarg, AF_INET)) {
@@ -177,7 +292,7 @@ int main(int argc, char **argv)
 			return 2;
 		}
 	}
-	if (!underlay) {
+	if (!underlay || !valid_ifname(underlay)) {
 		usage(argv[0]);
 		return 2;
 	}
@@ -187,10 +302,13 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	if (op == OP_WATCH)
+		return run_watch(underlay, mode_path, interval_ms, exit_after);
+
 	hook.ifindex = underlay_ifindex;
 	hook.attach_point = BPF_TC_EGRESS;
 
-	if (!attach) {
+	if (op == OP_DETACH) {
 		/* Fall back to the netfilter path before removing the classifier. */
 		if (set_mode(mode_path, "tunnel"))
 			return 1;

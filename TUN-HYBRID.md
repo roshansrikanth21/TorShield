@@ -1,7 +1,7 @@
 # Hybrid networking: a TUN-style netdevice for tunnel mode (option B)
 
 **Status:** route-based hybrid and TC (`tc` mode) prototypes implemented and runtime-verified
-on 6.8.0-147 (QEMU).
+on 6.8.0-147 (QEMU) and reproduced natively on 6.18.54.1 (WSL2/Hyper-V).
 **Build:** clean on 6.8.0-147 and 6.17.0-42.
 **Code:** `module/LKM/torshield.c` — `ts_ndo_start_xmit`, `ts_dev_setup`,
 `ts_newlink`, `ts_link_ops`, `TS_MODE_HYBRID`, `TS_MODE_TC`;
@@ -150,7 +150,8 @@ instead of being counted as malformed drops (`dev_drop` went from 3–5 per run 
 * **One underlay per device.** Multipath/ECMP is not implemented; endpoint roaming is (R36).
 * **No PMTU discovery / ICMP relay.** The MTU is static at 1360 and TCP adapts via MSS.
 * **Peer list and key are global** (shared by all netns), as in tunnel mode.
-* **No rekeying, no handshake, no DoS cookie** — unchanged from tunnel mode.
+* **No rekeying, no handshake, no DoS cookie** — tunnel mode's optional per-source
+  rate limiter (`ts_rl_pps`) still applies to the netfilter decap path.
 * **Global mode switch.** `hybrid`/`tc` affects every namespace; per-netns modes would need
   per-netns state.
 
@@ -176,11 +177,18 @@ classifier on the underlay's egress:
 **Why the AEAD is not in BPF.** The tunnel needs the synchronous ChaCha20/Poly1305 path;
 BPF helpers cannot call it. TC only classifies and redirects; the device encapsulates.
 
-**Fail-open caveat.** Netfilter `POST_ROUTING` runs **before** TC egress. In `tc` mode the
-netfilter egress hook is bypassed (otherwise packets would be encapsulated twice), so if the
-classifier disappears — qdisc deleted, program unloaded, wrong netns — peer traffic leaves in
-the clear. The helper orders attach → mode and mode → detach, but a supervisor is required in
-a real deployment. This is inherent to steering at TC rather than at netfilter.
+**Fail-open caveat and mitigation.** Netfilter `POST_ROUTING` runs **before** TC
+egress. In `tc` mode the netfilter egress hook is bypassed (otherwise packets would be
+encapsulated twice), so if the classifier disappears — qdisc deleted, program unloaded,
+wrong netns — peer traffic leaves in the clear. The helper orders attach → mode and
+mode → detach, but that only covers the normal path.
+
+`torshield-tc watch -i UNDERLAY [-n MS]` bounds the window: while the mode is `tc` it
+polls the underlay's egress filter and reverts the mode to `tunnel` as soon as the
+`ts_tc_egress` program is gone. Verified with a 200 ms interval: deleting the qdisc
+externally reverted the mode within ~0.5 s (`torshield-tc: classifier missing ...;
+reverting to tunnel`). This is a mitigation, not a fail-closed guarantee; a real
+deployment should run the watcher under systemd and monitor it.
 
 Verified with `stage21.sh` (R37–R40), distinct inner/outer addresses:
 
@@ -199,15 +207,23 @@ used the same address for inner and outer; some solicitations also had link-loca
 which the peer ACL correctly rejected (`tun_acl 27–28`). Fixed by separating inner/outer
 addresses and by skipping multicast and link-local sources in the classifier (`tun_acl 0`).
 
+The same stage21 checks were reproduced natively on 6.18.54.1: v4 **256/256**, v6 **64/64**,
+`dev_out 647`, `tun_out 0`, `tun_drop 0`, `dev_drop 0`, detach fallback **16/16**. Native v4
+wire verification is **210/210** with the per-peer key and **0/210** with the global PSK. The
+native v6 pcap capture is empty in the WSL harness, so the v6 wire evidence remains the QEMU
+**68/68** capture; the native v6 path itself is confirmed by the echo and counters.
+
 ---
 
 ## 6. Next steps
 
-1. Make TC egress fail closed (a supervisor that removes `tc` mode when the classifier is
-   gone, or a pre-TC drop design).
+1. Make TC egress **fully** fail closed: the watchdog (`torshield-tc watch`) bounds the
+   window to one poll, but a steering point before `POST_ROUTING` (or a kernel-side
+   classifier-presence check) is still needed for a guarantee.
 2. Advertise GSO/TSO and segment in the driver, then re-measure throughput.
 3. Deliver decapped packets through the tunnel netdevice (`skb->dev = torshield0`) so that
    `rp_filter`, policy routing and per-device counters apply to ingress as well.
 4. Add a small control plane (`ip link set … type torshield peer …`) instead of relying on
    the global peer list.
-5. Re-run the measurement suite on real hardware; the current numbers are TCG-emulated.
+5. Re-run the measurement suite on bare metal; the current throughput numbers are from a
+   native WSL2/Hyper-V VM (3.02–3.35 Gbit/s four-stream), not bare metal.

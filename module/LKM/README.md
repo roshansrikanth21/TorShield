@@ -48,8 +48,8 @@ device and the TC classifier can carry prefixes that overlap the underlay.
   followed by the 64-bit big-endian sequence number.
 - Plaintext is zero-padded to 64-byte buckets; the inner header determines the
   real length after decryption.
-- Replay window: 64 packets per peer, advanced only after successful
-  authentication.
+- Replay window: 1024 packets per peer, advanced only after successful
+  authentication (4-stream reordering exceeded the old 64-packet window).
 - Outer IPv4 packets get a per-packet IP ID so fragmented datagrams are safe.
 
 ## Build
@@ -130,14 +130,17 @@ classifier instance.
 > **Fail-open.** Netfilter `POST_ROUTING` runs before TC egress, so `tc` mode
 > cannot fail closed: if the qdisc or program disappears while the mode is `tc`,
 > peer traffic leaves in the clear. The helper orders attach/mode and
-> mode/detach, but a supervisor is required. See
+> mode/detach, and `torshield-tc watch -i DEV` reverts the mode when the
+> classifier disappears; a supervisor is still required. See
 > [`../../TUN-HYBRID.md`](../../TUN-HYBRID.md) §5.
 
 ## Known limitations
 
 - One static 256-bit PSK; no handshake, no forward secrecy, no rekeying.
-- DoS: any source can make the receiver perform a Poly1305 check (no cookie or
-  rate limit before authentication).
+- DoS: every framed packet still costs a Poly1305 check by default. An optional
+  per-source fixed-window limiter (`ts_rl_pps`, default 0 = off) rejects over-limit
+  packets before `skb_linearize`/authentication and counts them as `tun_rlimit`.
+  It is not a cookie challenge.
 - The peer list, key and mode are global module state shared across namespaces.
 - Cryptokey routing supports distinct inner/outer addresses and endpoint roaming;
   multipath/ECMP is not implemented.
