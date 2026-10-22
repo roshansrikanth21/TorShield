@@ -150,8 +150,12 @@ instead of being counted as malformed drops (`dev_drop` went from 3–5 per run 
 * **One underlay per device.** Multipath/ECMP is not implemented; endpoint roaming is (R36).
 * **No PMTU discovery / ICMP relay.** The MTU is static at 1360 and TCP adapts via MSS.
 * **Peer list and key are global** (shared by all netns), as in tunnel mode.
-* **No rekeying, no handshake, no DoS cookie** — tunnel mode's optional per-source
-  rate limiter (`ts_rl_pps`) still applies to the netfilter decap path.
+* **Manual rekey only, no handshake** — per-peer keys can be rotated with
+  `torshieldctl rekey-peer` and completed with `rekey-commit`; the old key is
+  accepted during the grace period (R51). There is no forward secrecy or
+  automatic coordination, and traffic can drop between the two ends' rekey
+  commands. There is also no DoS cookie; tunnel mode's optional per-source rate
+  limiter (`ts_rl_pps`) still applies to the netfilter decap path.
 * **Global mode switch.** `hybrid`/`tc` affects every namespace; per-netns modes would need
   per-netns state.
 

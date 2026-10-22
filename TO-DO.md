@@ -1,6 +1,6 @@
 # TorShield — Master To-Do & Evidence Log
 
-**Owner:** V. S. Roshan · **Started:** 2026-10-21 · **Last update:** 2026-10-21
+**Owner:** V. S. Roshan · **Started:** 2026-10-21 · **Last update:** 2026-10-22
 **Canonical code:** `module/LKM/torshield.c` (v4 — stream mode **and** UDP tunnel mode).
 The Notion plan was written against `original_repo/LKM/xor_obfuscation.c`; most Phase 0–3
 items were already implemented in v3, so they are marked as such below instead of redone.
@@ -24,6 +24,7 @@ Claims are labelled `BUILD-VERIFIED`, `RUNTIME-VERIFIED`, or `STATIC-ONLY`.
 | Tunnel control plane | **DONE (procfs)** — mode, key, peers, stats |
 | Hybrid TUN networking | **DONE (prototype)** — `torshield0` netdevice, v4 + v6 verified |
 | Cryptokey routing | **DONE (prototype)** — per-peer keys, allowed prefixes, endpoint roaming |
+| Manual key rotation | **DONE (prototype)** — dual-key grace + explicit commit; no handshake/forward secrecy (R51) |
 | TC clsact/eBPF egress (`tc` mode) | **DONE (prototype)** — LPM redirect to `torshield0`, v4 + v6 verified |
 | Native throughput (WSL2 6.18.54.1) | **DONE** — 1-stream 910–965 Mbit/s, 4-stream 3.02–3.35 Gbit/s, 30 s at 3.40 Gbit/s |
 | DoS rate limiter | **DONE** — per-source fixed window before the AEAD; off by default |
@@ -152,8 +153,10 @@ Legacy `original_repo` builds on 6.8 but not on ≥6.15 (`del_timer` removed). K
 | D2.7 | Sustained native 4-stream traffic exhausted memory and panicked the VM (`slab_unreclaimable` ~7.4 GB) | GSO egress copied every segment into an outer skb but never freed the original `seg` | `consume_skb(seg)` after a successful encapsulation; 30 s run now flat at 63–68 MB |
 | D2.8 | 4-stream native traffic counted 229 false replays and retransmitted | 64-packet anti-replay window smaller than the reordering across parallel veth queues | Window widened to 1024 packets; 0 replays on the same run |
 
-**Known limits of tunnel mode (honest list).** No rekeying or key rotation; no handshake or
-forward secrecy. The optional per-source rate limiter (`ts_rl_pps`) bounds pre-AEAD work but
+**Known limits of tunnel mode (honest list).** Per-peer keys support **manual** rotation
+(dual-key grace, explicit commit), but there is no handshake, no automated coordination
+between the ends, and no forward secrecy; the legacy global PSK cannot rotate in place.
+The optional per-source rate limiter (`ts_rl_pps`) bounds pre-AEAD work but
 is a fixed-window filter, not a cookie challenge, and is off by default. The peer list is
 global across netns; no PMTU discovery/ICMP relay. Large inner UDP datagrams rely on outer IP
 fragmentation and reassembly, verified up to 60 KB; the receiver linearizes the reassembled skb
@@ -168,7 +171,9 @@ that fails.
 - [x] AEAD + tags — ChaCha20-Poly1305, tunnel mode (R24)
 - [x] Per-packet sequence + 1024-packet replay window (R25, R46)
 - [ ] Per-flow key derivation (HKDF) from a master secret
-- [ ] Rekeying / key rotation and a handshake (currently one static PSK, no forward secrecy)
+- [x] Manual per-peer key rotation with dual-key grace and explicit commit (R51)
+- [ ] Automated handshake / coordinated rekey, and forward secrecy (rotation is manual and
+      can drop traffic between the two ends' commands)
 - [x] DoS hardening: per-source rate limit before `skb_linearize`/Poly1305 (R44)
 - [ ] Length-preserving MAC alternative for stream mode, or explicitly drop its integrity claim
 - [ ] Fix TCP seq wrap in stream mode (rekey per flow at ~2 GB, or counter-based nonce)
@@ -273,6 +278,8 @@ Environment: Ubuntu 24.04 cloud image, kernel `6.8.0-147-generic`, QEMU 8.2 TCG 
 | R48 | Native core regression on 6.18.54.1 | Tunnel v4 **256/256**, v6 **64/64**; stages 16/17/20: TCP **100%**, replay **1**, tamper drop **1**, unknown peer **1**, ACL **1**; TC detach fallback **16/16** |
 | R49 | Native throughput series, final module, 3 runs each | Baseline 4-stream **100.98 / 99.76 / 97.84 Gbit/s**; tunnel 1-stream **909.7 / 921.5 / 965.4 Mbit/s**; tunnel 4-stream **3345.6 / 3018.1 / 3203.1 Mbit/s**; RTT **0.052 ms** avg; `tun_drop 0`, `tun_replay 0` |
 | R50 | Native TC wire verification | v4 capture **210/210** authenticated with `K`, **0/210** with the global PSK, outer `10.0.1.1→10.0.1.2`. Native **v6** pcap capture is empty in this WSL harness (`-i any` shows the outer packet on `eth0`, `-Q in -i veth2` sees none), so the v6 wire claim remains the QEMU **68/68** result (R39), not a native claim |
+| R51 | Manual per-peer rekey, native stage23 | Egress capture on n2 showed key id **4290739141 → 1666914373** (seq 2 → 4) after `rekey-peer`; the peer printed `prev=4290739141`; old and new keys were both accepted during grace (**OLD-1, OLD-2, NEW-1, NEW-2**, 4/4); `rekey-commit` removed `prev`; the next old-key packet was rejected as non-peer (`tun_peer +1`, `tun_drop +0`); delta `tun_in 4`, `tun_rx 5`, `tun_replay 0`; same-key no-op rc=0, second rotation before commit rc=1 (state unchanged), commit-without-prev and invalid-hex rc=1 |
+| R52 | Regression on the rekey build, native 6.18.54.1 | stages 16/17/20 unchanged (TCP **100%**, replay **1**, tamper **1**, unknown peer **1**, ACL **1**); stage21 TC v4 **256/256**, v6 **64/64**, `dev_out 647`, `tun_out 0`, detach fallback **16/16**; stage22 off: all **1000** reached the AEAD; at 50 pps: **950** limited and **50** reached it; echo **64/64** |
 
 > R19/R20 are **not paper-grade**: TCG-emulated CPU. They show the direction and the overhead
 > source (per-byte software ChaCha20 + linearise), not real-hardware numbers.
@@ -296,18 +303,22 @@ WSL2 native ── 6.18.54.1-microsoft-standard-WSL2 (Hyper-V, 16 vCPU)
 * Build: `.work/rebuild.sh` (both kernels), `.work/build-w1.sh`.
 * Native WSL2 build: `.work/build-native.sh` (`KDIR=/root/wsl-kernel`); load: `.work/load-native.sh`.
 * Native tests: `.work/native-bench.sh`, `.work/stress-leak.sh`, `.work/native-rtt.sh`,
-  `.work/native-legacy2.sh`, `.work/native-stages.sh`, `.work/native-tc-verify.sh`.
+  `.work/native-legacy2.sh`, `.work/native-stages.sh`, `.work/native-rekey.sh`,
+  `.work/native-tc-verify.sh`.
 * VM: `.work/launch-vm.sh`, SSH `ssh -p 2222 ts@127.0.0.1`.
 * Stream-mode tests: `.work/vm-src/stage{1..15}.sh`, pcap analyser `.work/vm-src/pcap.py`.
 * Tunnel tests: `.work/vm-src/stage16.sh` (acceptance: build, load, TCP v4/v6, UDP,
   replay, tamper) and `.work/vm-src/stage17.sh` (replay/tamper/unknown-peer/interop).
   Hybrid device test: `.work/vm-src/stage18.sh` (device creation, v4 + v6 through
   `ndo_start_xmit`, coexistence with the netfilter path). Cryptokey routing:
-  `.work/vm-src/stage20.sh`. TC egress: `.work/vm-src/stage21.sh` (attach/detach, v4+v6
+  `.work/vm-src/stage20.sh`. Manual rekey: `.work/vm-src/stage23.sh` (dual-key grace,
+  commit, old-key rejection). TC egress: `.work/vm-src/stage21.sh` (attach/detach, v4+v6
   echo, path counters) and `.work/vm-src/tc6cap.sh`; `.work/vm-src/runlegacy2.sh` re-runs
   stages 16–20 on a clean module.
   Independent checks: `verify_tunnel.py` (decrypts the capture with python-`cryptography`),
-  `inject.py` (builds tunnel packets from scratch), `replay.py` (replays captured frames).
+  `inject.py`/`inject2.py` (build tunnel packets from scratch, including per-peer key ids),
+  `sniff_key.py` (captures the outer key id/seq for rekey evidence), `replay.py` (replays
+  captured frames).
 
 ---
 
@@ -315,7 +326,10 @@ WSL2 native ── 6.18.54.1-microsoft-standard-WSL2 (Hyper-V, 16 vCPU)
 
 **Tunnel mode (default):**
 
-1. **Static single PSK** — no handshake, no rekeying, no forward secrecy.
+1. **No handshake or forward secrecy** — per-peer keys can be rotated **manually**
+   (`rekey-peer`/`rekey-commit`, R51), with the old key accepted during grace. Both
+   ends must be rekeyed, traffic can drop between the commands, and the legacy global
+   PSK cannot rotate in place.
 2. **Limited DoS protection** — every framed packet still costs a Poly1305 verification unless
    the optional per-source fixed-window limiter (`ts_rl_pps`) is enabled; there is no cookie
    challenge, and the limiter is off by default so throughput tests are not capped.

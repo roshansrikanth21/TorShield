@@ -5,8 +5,10 @@
  * Usage:
  *   torshieldctl status
  *   torshieldctl set-key <hex>        (64 hex chars = 256-bit ChaCha20 key)
- *   torshieldctl add-peer <ip>
+ *   torshieldctl add-peer <ip> [key <hex>] [allowed <cidr,...>]
  *   torshieldctl del-peer <ip>
+ *   torshieldctl rekey-peer <ip> <hex>   (keep old key accepted)
+ *   torshieldctl rekey-commit <ip>       (drop the old key)
  *   torshieldctl list-peers
  *   torshieldctl clear-peers
  *
@@ -66,9 +68,11 @@ static void usage(const char *p)
 		"  %s set-key <hex>\n"
 		"  %s add-peer <endpoint> [key <64 hex>] [allowed <cidr[,cidr...]>]\n"
 		"  %s del-peer <endpoint>\n"
+		"  %s rekey-peer <endpoint> <64 hex>\n"
+		"  %s rekey-commit <endpoint>\n"
 		"  %s list-peers\n"
 		"  %s clear-peers\n",
-		p, p, p, p, p, p);
+		p, p, p, p, p, p, p, p);
 }
 
 int main(int argc, char **argv)
@@ -94,6 +98,21 @@ int main(int argc, char **argv)
 
 	if (!strcmp(argv[1], "set-key"))
 		return write_proc("psk", argv[2]) < 0 ? 1 : 0;
+
+	if (!strcmp(argv[1], "rekey-peer")) {
+		char v[160];
+
+		if (argc < 4)
+			return 1;
+		snprintf(v, sizeof(v), "%s %s", argv[2], argv[3]);
+		return write_proc("rekey", v) < 0 ? 1 : 0;
+	}
+	if (!strcmp(argv[1], "rekey-commit")) {
+		char v[96];
+
+		snprintf(v, sizeof(v), "%s commit", argv[2]);
+		return write_proc("rekey", v) < 0 ? 1 : 0;
+	}
 
 	if (!strcmp(argv[1], "add-peer")) {
 		char v[1024];

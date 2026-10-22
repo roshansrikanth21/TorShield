@@ -38,6 +38,26 @@ sudo ./torshieldctl add-peer fd01::2  key <64-hex> allowed fd00::1/128,fd00::2/1
 This lets the inner prefixes differ from the underlay, so the route-based hybrid
 device and the TC classifier can carry prefixes that overlap the underlay.
 
+### Manual key rotation
+
+```bash
+sudo ./torshieldctl rekey-peer 10.0.1.2 <new-64-hex>
+sudo ./torshieldctl rekey-commit 10.0.1.2
+```
+
+`rekey-peer` starts sending with the new key and keeps the previous key accepted
+for ingress; `list-peers` shows `prev=<key-id>` during this grace period.
+`rekey-commit` erases the previous key, after which packets carrying the old key
+ID are rejected as non-peer traffic. A second `rekey-peer` before `commit` is
+rejected, so commit before rotating again. The endpoint must still match the peer
+(roaming changes it to the last authenticated sender).
+
+Limits: this is **manual** rotation, not a handshake. Both ends must run
+`rekey-peer`, and traffic can drop between the two commands; the grace period
+only protects packets already in flight. There is no forward secrecy, and a
+legacy global-PSK peer (`key=global`) must be re-added with a per-peer key before
+it can rotate.
+
 ## Crypto and framing
 
 - **ChaCha20-Poly1305** (RFC 7539), synchronous, using the in-kernel ChaCha20
@@ -136,7 +156,9 @@ classifier instance.
 
 ## Known limitations
 
-- One static 256-bit PSK; no handshake, no forward secrecy, no rekeying.
+- No handshake or forward secrecy. Per-peer keys support **manual** rotation with
+  a dual-key grace period; the legacy global PSK does not, and rotation is not
+  coordinated automatically between the two ends.
 - DoS: every framed packet still costs a Poly1305 check by default. An optional
   per-source fixed-window limiter (`ts_rl_pps`, default 0 = off) rejects over-limit
   packets before `skb_linearize`/authentication and counts them as `tun_rlimit`.

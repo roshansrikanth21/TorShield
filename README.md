@@ -27,6 +27,8 @@ Tunnel, hybrid and TC share one wire format and interoperate.
 - Padding to 64-byte buckets, so ciphertext length leaks less than plaintext length.
 - A 64-bit per-peer sequence number, used as the AEAD nonce and checked against a
   **1024-packet** replay window **after** authentication.
+- **Manual key rotation** for per-peer keys: the old key stays accepted during a
+  grace period, then an explicit commit removes it. This is not a handshake.
 - Fail-closed behaviour in tunnel and hybrid modes: malformed, unauthenticated,
   replayed or unknown-source packets are dropped and counted, never forwarded.
   TC mode depends on the classifier being attached; see the warning below.
@@ -34,7 +36,9 @@ Tunnel, hybrid and TC share one wire format and interoperate.
 
 **Does not provide**
 
-- No handshake, no forward secrecy, no key rotation: one static 256-bit PSK.
+- No handshake and no forward secrecy. Key rotation is **manual** and applies
+  only to peers that already have a per-peer key; a legacy global-PSK peer must
+  be reconfigured first.
 - No metadata protection: outer addresses, ports, timing and approximate size remain visible.
 - No PMTU discovery/ICMP relay. TCP MSS is clamped (1360 v4 / 1340 v6); large UDP
   datagrams rely on outer IP fragmentation and reassembly.
@@ -125,6 +129,23 @@ an outer endpoint, with endpoint roaming after authenticated traffic. The device
 path can therefore carry inner prefixes that are distinct from the underlay; see
 [`TUN-HYBRID.md`](TUN-HYBRID.md) §2.4.
 
+### Manual rekey (per-peer keys)
+
+```bash
+sudo ./torshieldctl rekey-peer 10.0.0.2 <new-64-hex>   # keep old key accepted
+sudo ./torshieldctl rekey-commit 10.0.0.2             # reject the old key now
+sudo ./torshieldctl list-peers                        # shows prev=<key-id> during grace
+```
+
+`rekey-peer` moves the current key to the previous slot and starts sending with
+the new key. The receiver accepts **both** key IDs until `rekey-commit`, which
+erases the previous key. A second `rekey-peer` before `commit` is rejected, so
+the oldest key cannot be silently discarded. This covers packets already in
+flight, but it is not a staged handshake: both ends must be rekeyed, so peer
+traffic can drop between the two commands. Use the peer's current endpoint, as
+roaming may have changed it. There is no forward secrecy, and compromising either
+key during the grace period is enough. Only peers with a per-peer key can rotate.
+
 ### TC mode (clsact/eBPF)
 
 TC mode keeps the device and wire format but replaces routes with an eBPF classifier
@@ -205,6 +226,7 @@ Two issues were exposed only by sustained native load and are fixed:
 | TC, independent AEAD on the wire | v4 **210/210** with `K`, **0/210** with the global PSK; v6 **68/68** with `K6`, **0/68** with the PSK |
 | TC, detach fallback | mode returns to `tunnel`; netfilter echo **16/16**, `tun_out +32` |
 | Per-source rate limiter (`ts_rl_pps=50`) | **950/1000** stopped before the AEAD, **50** reached it; legitimate echo **64/64** |
+| Manual rekey (native stage23) | captured **egress** key id changed K→K2 (`4290739141`→`1666914373`); old + new keys accepted during grace **4/4** payloads; post-commit old-key packet rejected as non-peer **1**, `tun_in +4`, `tun_peer +1`, `tun_replay 0` |
 | TC watchdog | external `tc qdisc del` reverted mode to `tunnel` within **~0.5 s** (200 ms poll) |
 | `make W=1` | clean on 6.8.0-147 and 6.17.0-42 |
 
@@ -232,10 +254,12 @@ The VM harness lives in [`.work/vm-src/`](.work/vm-src/):
 | `stage19.sh` | large UDP datagrams (4 KB, 60 KB) and outer fragmentation analysis |
 | `stage20.sh` | cryptokey routing: per-peer keys, allowed prefixes, ACL, endpoint roaming |
 | `stage21.sh` | TC attach/detach, IPv4/IPv6 echo, path counters, fallback to `tunnel` |
+| `stage23.sh` | manual rekey: dual-key grace, explicit commit, old-key rejection |
 | `runlegacy2.sh` | re-runs stages 16–20 on a clean module |
 | `verify_tunnel.py` | host-side ChaCha20-Poly1305 verification of a capture |
 | `defrag_verify.py` | defragments IPv4 captures, then verifies the AEAD |
 | `inject.py` / `replay.py` | independent packet builder, replay/tamper harness |
+| `inject2.py` / `sniff_key.py` | per-peer-key packet builder; captures the outer key id/seq for rekey evidence |
 
 `stage*.sh` are run as root inside the VM; `verify_tunnel.py` and
 `defrag_verify.py` run on the host against the captured pcap.

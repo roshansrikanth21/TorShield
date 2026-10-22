@@ -103,6 +103,9 @@ struct ts_peer {
 	} addr;                                   /* endpoint address           */
 	u8               key[CHACHA_KEY_SIZE];    /* per-peer key (key_id != 0) */
 	u32              key_id;                  /* 0 = legacy global-PSK peer */
+	u8               prev_key[CHACHA_KEY_SIZE]; /* accepted during rekey   */
+	u32              prev_key_id;
+	bool             has_prev;
 	u8               n_prefixes;              /* allowed inner destinations */
 	struct ts_prefix prefix[TS_MAX_PREFIXES];
 	/* tunnel mode state */
@@ -271,10 +274,30 @@ static struct ts_peer *peer_find_id_locked(u32 key_id)
 
 	if (!key_id)
 		return NULL;
+	/* Current keys take precedence over a previous key from a rekey. */
 	list_for_each_entry(p, &peer_list, list)
 		if (p->key_id == key_id)
 			return p;
+	list_for_each_entry(p, &peer_list, list)
+		if (p->has_prev && p->prev_key_id == key_id)
+			return p;
 	return NULL;
+}
+
+/* Copy the key that matches this wire key id (current or, during a manual
+ * rekey grace period, the previous key). */
+static bool peer_key_for_locked(const struct ts_peer *p, u32 key_id,
+				u8 key[CHACHA_KEY_SIZE])
+{
+	if (p->key_id == key_id) {
+		memcpy(key, p->key, CHACHA_KEY_SIZE);
+		return true;
+	}
+	if (p->has_prev && p->prev_key_id == key_id) {
+		memcpy(key, p->prev_key, CHACHA_KEY_SIZE);
+		return true;
+	}
+	return false;
 }
 
 /* ---- cryptokey routing (allowed inner prefixes) ------------------------ */
@@ -1627,8 +1650,8 @@ static unsigned int ts_tun_decap(struct sk_buff *skb, bool outer_v6,
 	spin_lock_irqsave(&cfg_lock, flags);
 	if (key_id) {
 		p = peer_find_id_locked(key_id);
-		if (p)
-			memcpy(key, p->key, sizeof(key));
+		if (p && !peer_key_for_locked(p, key_id, key))
+			p = NULL;
 	} else {
 		p = outer_v6 ? peer_find_locked(AF_INET6,
 						&ipv6_hdr(skb)->saddr)
@@ -2279,6 +2302,8 @@ static int peers_show(struct seq_file *m, void *v)
 			seq_printf(m, " key=%u", p->key_id);
 		else
 			seq_puts(m, " key=global");
+		if (p->has_prev)
+			seq_printf(m, " prev=%u", p->prev_key_id);
 		seq_puts(m, " allowed=");
 		for (i = 0; i < p->n_prefixes; i++) {
 			if (i)
@@ -2343,6 +2368,23 @@ static int parse_prefix(const char *s, struct ts_prefix *pf)
 	if (len < 0 || len > (pf->family == AF_INET ? 32 : 128))
 		return -EINVAL;
 	pf->len = (u8)len;
+	return 0;
+}
+
+static int parse_key_hex(const char *hex, u8 key[CHACHA_KEY_SIZE])
+{
+	int i;
+
+	if (!hex || strlen(hex) != 2 * CHACHA_KEY_SIZE)
+		return -EINVAL;
+	for (i = 0; i < CHACHA_KEY_SIZE; i++) {
+		int hi = hex_to_bin(hex[2 * i]);
+		int lo = hex_to_bin(hex[2 * i + 1]);
+
+		if (hi < 0 || lo < 0)
+			return -EINVAL;
+		key[i] = (hi << 4) | lo;
+	}
 	return 0;
 }
 
@@ -2484,6 +2526,101 @@ static const struct proc_ops peers_fops = {
 	.proc_lseek   = seq_lseek,
 	.proc_release = single_release,
 	.proc_write   = peers_write,
+};
+
+/* ---- /proc/torshield/rekey --------------------------------------------- */
+/* Manual rekey with a grace period: a peer keeps its previous key accepted
+ * until "<endpoint> commit".  This is key rotation, not a handshake: both
+ * ends must be rekeyed explicitly and there is no forward secrecy. */
+static ssize_t rekey_write(struct file *file, const char __user *ubuf,
+			   size_t count, loff_t *pos)
+{
+	char *buf, *s, *eps, *arg, *extra;
+	u8 family, newkey[CHACHA_KEY_SIZE] = {0};
+	union { __be32 v4; struct in6_addr v6; } addr;
+	struct ts_peer *p;
+	unsigned long flags;
+	u32 new_id = 0;
+	int ret = -EINVAL;
+	bool commit;
+
+	if (count == 0 || count > 256)
+		return -EINVAL;
+	buf = kzalloc(count + 1, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	if (copy_from_user(buf, ubuf, count)) {
+		ret = -EFAULT;
+		goto out;
+	}
+	s = strim(buf);
+	eps = strsep(&s, " \t");
+	arg = s ? strsep(&s, " \t") : NULL;
+	extra = s ? strim(s) : NULL;
+	if (!eps || !*eps || !arg || !*arg || (extra && *extra))
+		goto out;
+	if (parse_addr(eps, &family, &addr))
+		goto out;
+	commit = !strcmp(arg, "commit");
+	if (!commit) {
+		if (parse_key_hex(arg, newkey))
+			goto out;
+		new_id = ts_key_id_for(newkey);
+	}
+
+	spin_lock_irqsave(&cfg_lock, flags);
+	p = peer_find_locked(family, family == AF_INET ? (void *)&addr.v4
+						       : (void *)&addr.v6);
+	if (!p) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+	if (commit) {
+		if (!p->has_prev) {
+			ret = -EINVAL;
+			goto unlock;
+		}
+		memzero_explicit(p->prev_key, sizeof(p->prev_key));
+		p->prev_key_id = 0;
+		p->has_prev = false;
+		ret = count;
+		goto unlock;
+	}
+	/* Only a peer that already uses a per-peer key can be rotated; a
+	 * legacy global-PSK peer must first be re-added with a key. */
+	if (!p->key_id) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	if (new_id == p->key_id) {
+		ret = memcmp(newkey, p->key, sizeof(p->key)) ? -EEXIST : count;
+		goto unlock;
+	}
+	/* One grace key at a time: a second rotation must be preceded by a
+	 * commit, otherwise the oldest key would be silently discarded. */
+	if (p->has_prev) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	memcpy(p->prev_key, p->key, sizeof(p->key));
+	p->prev_key_id = p->key_id;
+	p->has_prev = true;
+	memcpy(p->key, newkey, sizeof(p->key));
+	p->key_id = new_id;
+	ret = count;
+
+unlock:
+	spin_unlock_irqrestore(&cfg_lock, flags);
+out:
+	memzero_explicit(newkey, sizeof(newkey));
+	memzero_explicit(buf, count);
+	kfree(buf);
+	return ret;
+}
+
+static const struct proc_ops rekey_fops = {
+	.proc_open    = NULL,
+	.proc_write   = rekey_write,
 };
 
 /* ---- /proc/torshield/mode ---------------------------------------------- */
@@ -2667,6 +2804,7 @@ static int __init torshield_init(void)
 	/* 0600: key control is root-only, and nothing is world-readable. */
 	if (!proc_create("psk",    0600, proc_dir, &psk_fops) ||
 	    !proc_create("peers",  0600, proc_dir, &peers_fops) ||
+	    !proc_create("rekey",  0600, proc_dir, &rekey_fops) ||
 	    !proc_create("mode",   0600, proc_dir, &mode_fops) ||
 	    !proc_create("stats",  0444, proc_dir, &stats_fops)) {
 		ret = -ENOMEM;
