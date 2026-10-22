@@ -8,9 +8,11 @@ paper is written around the code in `module/LKM/` and the evidence log in
 
 | File | Purpose |
 |---|---|
-| `TorShield_IEEE.tex` | IEEEtran conference source. |
-| `references.bib` | Bibliography for the manuscript. |
-| `TorShield_IEEE.pdf` | Compiled 6-page manuscript (US Letter). |
+| `TorShield_IEEE.tex` | Full IEEEtran conference manuscript (archival version). |
+| `TorShield_IEEE.pdf` | Compiled full manuscript, exactly 6 pages (US Letter). |
+| `TorShield_RAIT2027_DC.tex` | RAIT 2027 Doctoral Consortium extended abstract source. |
+| `TorShield_RAIT2027_DC.pdf` | Compiled Doctoral Consortium abstract, exactly 4 pages including references (US Letter). |
+| `references.bib` | Shared bibliography for both versions. |
 | `CLAIM_EVIDENCE.md` | Claim-to-evidence audit and the list of withdrawn draft claims. |
 | `archive/TorShield_IEEE_2026-06-27_initial_draft.{docx,pdf}` | Preserved initial XOR draft, for provenance only. |
 
@@ -23,13 +25,45 @@ Requires a TeX Live installation with `IEEEtran`, `tikz`, `booktabs`, and
 sudo apt-get install -y texlive-latex-base texlive-latex-recommended \
   texlive-publishers texlive-fonts-recommended texlive-pictures latexmk
 cd paper
+
+# Full archival manuscript: exactly 6 pages.
 latexmk -pdf -interaction=nonstopmode -halt-on-error TorShield_IEEE.tex
+
+# RAIT 2027 Doctoral Consortium abstract: exactly 4 pages including references.
+latexmk -pdf -interaction=nonstopmode -halt-on-error TorShield_RAIT2027_DC.tex
 ```
 
-The checked-in PDF was built with pdfTeX 1.40.25 (TeX Live 2023) and is six
-pages (US Letter), matching the confirmed six-page limit. The reduction from
-the earlier seven-page draft was done by tightening prose and table content,
-not by shrinking the font or margins.
+The checked-in PDFs were built with pdfTeX (TeX Live 2023) and are US Letter.
+The full manuscript is six pages. The Doctoral Consortium version is four pages
+including references; it uses the same `IEEEtran` class and the official IEEE
+conference template's `\documentclass[conference]{IEEEtran}` settings.
+
+## RAIT 2027 Doctoral Consortium
+
+- **Submission format:** one PDF containing, in order, the **4-page extended
+  abstract** (references included), a **1-page resume**, and a **1-page
+  supervisor recommendation**. Total: **6 pages** in one file.
+- **Abstract source/PDF:** `TorShield_RAIT2027_DC.tex` and
+  `TorShield_RAIT2027_DC.pdf`. The PDF is exactly four pages and uses two
+  side-by-side author blocks (Roshan Srikanth and Dr. S. UdhayaKumar), as
+  requested.
+- **Review model:** single-blind, so author names, affiliations, and emails are
+  included. The main conference is double-blind; do not reuse this author block
+  there.
+- **Domain:** 03 — Big Data Analytics, Cloud Computing & Cyber Security.
+- **Similarity:** must be below 10%. Run the venue's checker on the complete
+  six-page submission PDF, not only on the four-page abstract.
+- **Deadline:** November 2, 2026, Anywhere on Earth (AoE). Notification:
+  November 30, 2026. Camera-ready: December 15, 2026.
+- **Eligibility:** registered Ph.D. student in the first three years; at least
+  one author must register and present in person; no remote presentation and no
+  travel grants.
+- **Missing before submission:** the one-page resume and the one-page
+  supervisor recommendation are not in this repository. Merge them with the
+  four-page abstract only after both are final.
+
+Do not submit the six-page `TorShield_IEEE.pdf` to the Doctoral Consortium. It
+is the archival full paper, not the four-page Doctoral Consortium abstract.
 
 ## What changed from the initial draft
 
@@ -53,16 +87,29 @@ not by shrinking the font or margins.
 
 ## Before submission
 
-1. Confirm the target IEEE venue and submission deadline; the six-page limit
-   is already satisfied.
+1. For the Doctoral Consortium, use only
+   `TorShield_RAIT2027_DC.pdf` plus the one-page resume and one-page supervisor
+   recommendation, merged into a single PDF. The full `TorShield_IEEE.pdf` is
+   not the Doctoral Consortium submission.
 2. Confirm the author list and email addresses: Roshan Srikanth and
-   S. UdhayaKumar. The address `roshansrikanth21@gmail.com` matches the
-   repository Git configuration and should be confirmed before submission.
-3. Decide whether to add a bare-metal throughput run. The current performance
-   numbers are from a WSL2/Hyper-V VM, and the paper says so.
-4. The manuscript already includes one compact v4 datapath figure (Fig. 1).
-   Do not reuse the old XOR diagrams or the `/proc/xor_key` screenshots.
-5. Rebuild the PDF after any edit and run:
-   `grep -nE 'Overfull|Undefined|undefined|Warning' TorShield_IEEE.log`.
-6. Keep `CLAIM_EVIDENCE.md` in sync with any new result. Do not add a number to
-   the paper without a captured log.
+   Dr. S. UdhayaKumar. The address `roshansrikanth21@gmail.com` matches the
+   repository Git configuration. The Doctoral Consortium is single-blind, so
+   include both names, the affiliation, and both emails on page 1.
+3. Confirm Ph.D. registration and that the applicant is within the first three
+   years of the doctoral program; this is an eligibility condition, not a
+   formatting detail.
+4. Decide whether to add a bare-metal throughput run. The current performance
+   numbers are from a WSL2/Hyper-V VM, and both versions say so.
+5. Both versions already include one compact v4 datapath figure (Fig. 1). Do
+   not reuse the old XOR diagrams or the `/proc/xor_key` screenshots.
+6. Rebuild both PDFs after any edit and check page counts and warnings:
+   ```bash
+   pdfinfo TorShield_IEEE.pdf | grep Pages
+   pdfinfo TorShield_RAIT2027_DC.pdf | grep Pages
+   grep -nE 'Overfull|Undefined|undefined|Warning' TorShield_IEEE.log \
+     TorShield_RAIT2027_DC.log
+   ```
+7. Keep `CLAIM_EVIDENCE.md` in sync with any new result. Do not add a number to
+   either paper without a captured log.
+8. Run the similarity check on the final merged six-page PDF and confirm it is
+   below 10% before the November 2, 2026 AoE deadline.

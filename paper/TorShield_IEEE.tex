@@ -12,7 +12,7 @@
 \usepackage[hidelinks]{hyperref}
 \hypersetup{
   pdftitle={TorShield: A Transparent In-Kernel Authenticated Tunnel with Fail-Closed TC Steering},
-  pdfauthor={Roshan Srikanth and S. UdhayaKumar},
+  pdfauthor={Roshan Srikanth and Dr. S. UdhayaKumar},
   pdfkeywords={Linux kernel, network security, authenticated encryption, ChaCha20-Poly1305, Netfilter, eBPF, traffic control}
 }
 
@@ -22,9 +22,13 @@
 \title{\sys: A Transparent In-Kernel Authenticated Tunnel with Fail-Closed TC Steering}
 
 \author{
-\IEEEauthorblockN{Roshan Srikanth and S. UdhayaKumar}
+\IEEEauthorblockN{Roshan Srikanth}
 \IEEEauthorblockA{Amrita Vishwa Vidyapeetham\\
-Email: roshansrikanth21@gmail.com, sudhayakumar@ch.amrita.edu}
+Email: roshansrikanth21@gmail.com}
+\and
+\IEEEauthorblockN{Dr. S. UdhayaKumar}
+\IEEEauthorblockA{Amrita Vishwa Vidyapeetham\\
+Email: sudhayakumar@ch.amrita.edu}
 }
 
 \begin{document}
@@ -136,7 +140,7 @@ The 16-byte header is the AEAD associated data. It contains a two-byte \code{TS}
 The outer IPv4 identification field is assigned from a per-packet counter. This matters when a large inner UDP datagram is split into multiple outer IP fragments: a constant zero would make fragments from different datagrams indistinguishable to reassembly. The outer UDP checksum is zero over IPv4, which is legal; integrity is provided by the AEAD tag.
 
 \paragraph{Port choice}
-The default outer port is 4789, the IANA VXLAN port \cite{mahalingam2014vxlan}. Wireshark and similar tools may heuristically label the outer datagrams as VXLAN. That is a display heuristic: the payload is the \code{TS} header and AEAD ciphertext, not a VXLAN encapsulation. The port can be changed at module load.
+The default outer port is 4789, the IANA VXLAN port. Wireshark and similar tools may heuristically label the outer datagrams as VXLAN. That is a display heuristic: the payload is the \code{TS} header and AEAD ciphertext, not a VXLAN encapsulation. The port can be changed at module load.
 
 \subsection{Peer Table and Cryptokey Routing}
 Each peer entry contains a 32-byte key, a deterministic 32-bit key identifier (full FNV-1a of the key, with zero reserved), an outer endpoint, and up to eight allowed inner prefixes. Egress selects the peer by longest-prefix match on the inner destination. Ingress looks up the peer by the wire key identifier (or by outer source for a legacy global-PSK peer), authenticates, and then checks the decrypted inner source against that peer's allowed prefixes. A packet whose inner source is outside the allowed set is dropped and counted. The key identifier is a selector, not an authenticator: an observer can read it, but cannot produce a valid tag without the key. After a packet authenticates, a peer configured with a per-peer key may roam to the new outer source address, so a mobile endpoint can change addresses without a control message.
