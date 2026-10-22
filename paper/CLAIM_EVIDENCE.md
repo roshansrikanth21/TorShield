@@ -92,4 +92,4 @@ draft is preserved under `paper/archive/` and is not the evaluated system.
 5. **IPv6 rekey test.** Rekey is IPv4-only in the current evidence.
 6. **Zero-race TC guard.** The residual check-to-egress race is documented, not closed.
 7. **CPU cost model.** No per-packet CPU time or cycles/byte measurement.
-8. **Venue metadata.** Target IEEE venue, page limit, authorship order, and submission deadline still need confirmation.
+8. **Venue metadata.** Target IEEE venue and submission deadline still need confirmation; the six-page limit is satisfied. The author list is Roshan Srikanth and S. UdhayaKumar; the email address `roshansrikanth21@gmail.com` matches the repository Git configuration and should be confirmed before submission.

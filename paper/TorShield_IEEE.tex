@@ -11,7 +11,7 @@
 \usepackage[hidelinks]{hyperref}
 \hypersetup{
   pdftitle={TorShield: A Transparent In-Kernel Authenticated Tunnel with Fail-Closed TC Steering},
-  pdfauthor={Yash Yashuday and S. UdhayaKumar},
+  pdfauthor={Roshan Srikanth and S. UdhayaKumar},
   pdfkeywords={Linux kernel, network security, authenticated encryption, ChaCha20-Poly1305, Netfilter, eBPF, traffic control}
 }
 
@@ -21,16 +21,16 @@
 \title{\sys: A Transparent In-Kernel Authenticated Tunnel with Fail-Closed TC Steering}
 
 \author{
-\IEEEauthorblockN{Yash Yashuday and S. UdhayaKumar}
+\IEEEauthorblockN{Roshan Srikanth and S. UdhayaKumar}
 \IEEEauthorblockA{Amrita Vishwa Vidyapeetham\\
-Email: yyashuday@gmail.com, sudhayakumar@ch.amrita.edu}
+Email: roshansrikanth21@gmail.com, sudhayakumar@ch.amrita.edu}
 }
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-Application-level encryption protects payloads but leaves addresses, ports, timing, and packet sizes observable, and it requires every application to participate. This paper presents \sys, a Linux kernel module that provides transparent, point-to-point authenticated encryption for peer-destined IPv4 and IPv6 traffic. \sys{} encapsulates packets in UDP with ChaCha20--Poly1305, a 16-byte authenticated header, per-peer 64-bit sequence numbers, a 1024-packet replay window, and padding to 64-byte buckets. The same wire format is shared by three egress-steering mechanisms: a netfilter destination match, a route-based virtual L3 netdevice, and a TC clsact/eBPF redirect. For the TC path we add a kernel-side fail-closed guard at \code{LOCAL\_OUT} and \code{FORWARD}; if the egress classifier or qdisc is removed, peer-destined packets are dropped before they can leave in clear. We report only measurements that were actually captured. On an Ubuntu 24.04 QEMU testbed, 1\,MB IPv4 and 256\,KB IPv6 TCP transfers were byte-exact, and independent ChaCha20--Poly1305 verification accepted 1054/1054 tunnel frames. TC deletion tests blocked 8/8 local sends and 8/8 forwarded packets with zero outer packets. On a native WSL2/Hyper-V VM, a 30\,s four-stream run sustained 3.40\,Gbit/s with flat unreclaimable slab memory. We also report four defects found by the evaluation and fixed in the current code. \sys{} is not Tor, does not provide anonymity, and does not replace WireGuard or IPsec; it is a research and measurement vehicle for transparent in-kernel tunneling.
+Application-level encryption protects payloads but leaves metadata visible and requires per-application changes. \sys{} is a Linux kernel module that transparently encrypts peer-destined IPv4/IPv6 traffic in UDP using ChaCha20--Poly1305, a 16-byte authenticated header, per-peer 64-bit sequence numbers, a 1024-packet replay window, and 64-byte padding. The same wire format is used by Netfilter, a route-based L3 device, and TC clsact/eBPF steering. For TC, a kernel guard at \code{LOCAL\_OUT}/\code{FORWARD} drops peer-destined packets when the egress classifier or qdisc is removed. We report captured results: 1\,MB IPv4 and 256\,KB IPv6 TCP transfers were byte-exact; independent AEAD verification accepted 1054/1054 tunnel frames; deletion tests blocked 8/8 local sends and 8/8 forwarded packets with zero outer packets; a 30\,s four-stream native VM run sustained 3.40\,Gbit/s with flat unreclaimable memory. We also report four defects found and fixed. \sys{} is not Tor, provides no anonymity, and does not replace WireGuard or IPsec.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -47,11 +47,9 @@ This paper describes the current \sys{} design. An earlier draft of this work de
 
 \subsection{Contributions}
 \begin{itemize}
-\item A Linux kernel datapath that transparently encapsulates peer-destined IPv4/IPv6 packets in UDP with ChaCha20--Poly1305, a 32-bit key identifier, a 64-bit per-peer sequence number, 64-byte padding buckets, and a 1024-packet replay window.
-\item One wire format shared by three steering mechanisms---Netfilter destination matching, a route-based virtual L3 device, and a TC clsact/eBPF redirect---with per-peer keys, allowed inner prefixes, and authenticated endpoint roaming.
-\item A kernel-side fail-closed guard for TC mode at \code{LOCAL\_OUT} and \code{FORWARD}, plus loader map completeness and peer-change invalidation. We test classifier and qdisc deletion on local and forwarded paths.
-\item An empirical evaluation on two kernel versions and a native VM, including independent AEAD verification, TC deletion tests, manual rekey, a per-source rate limiter, and a 30\,s sustained-load run. We report four defects that the evaluation exposed and that are fixed in the current code.
-\item An explicit limitations section. We do not claim CPU utilization, per-packet latency, module size, 72-hour stability, bare-metal throughput, or a multi-distribution kernel matrix; those claims from the earlier draft are withdrawn.
+\item A kernel datapath and wire format for transparent peer-destined IPv4/IPv6 traffic: ChaCha20--Poly1305, a 32-bit key identifier, 64-bit per-peer sequence numbers, 64-byte padding, a 1024-packet replay window, and per-peer allowed prefixes with authenticated roaming.
+\item One wire format shared by Netfilter, a route-based L3 device, and TC clsact/eBPF steering, plus a kernel-side fail-closed TC guard at \code{LOCAL\_OUT}/\code{FORWARD} and loader map completeness. We test classifier and qdisc deletion on local and forwarded paths.
+\item An empirical study on two kernel versions and a native VM, with independent AEAD verification, deletion tests, manual rekey, a rate limiter, and a 30\,s sustained run. We report four defects found and fixed, and we withdraw the draft's unverified CPU, latency, footprint, stability, and distribution claims.
 \end{itemize}
 
 \section{Threat Model and Scope}
