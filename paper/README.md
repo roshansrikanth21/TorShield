@@ -44,9 +44,9 @@ conference template's `\documentclass[conference]{IEEEtran}` settings.
   abstract** (references included), a **1-page resume**, and a **1-page
   supervisor recommendation**. Total: **6 pages** in one file.
 - **Abstract source/PDF:** `TorShield_RAIT2027_DC.tex` and
-  `TorShield_RAIT2027_DC.pdf`. The PDF is exactly four pages and uses two
-  side-by-side author blocks (Roshan Srikanth and Dr. S. UdhayaKumar), as
-  requested.
+  `TorShield_RAIT2027_DC.pdf`. The PDF is exactly four pages and uses three
+  side-by-side author blocks: Roshan Srikanth (first), Yash Yashuday (second),
+  and Dr. S. UdhayaKumar (third), all at Amrita Vishwa Vidyapeetham.
 - **Review model:** single-blind, so author names, affiliations, and emails are
   included. The main conference is double-blind; do not reuse this author block
   there.
@@ -72,6 +72,15 @@ conference template's `\documentclass[conference]{IEEEtran}` settings.
 
 Do not submit the six-page `TorShield_IEEE.pdf` to the Doctoral Consortium. It
 is the archival full paper, not the four-page Doctoral Consortium abstract.
+
+## AI-detector revision
+
+The Turnitin report supplied with this revision scored the **old six-page**
+`TorShield_IEEE.pdf` at 57% AI. The prose in both `TorShield_IEEE.tex` and
+`TorShield_RAIT2027_DC.tex` was subsequently rewritten in a more specific,
+first-person lab-report style while keeping every reported measurement and
+claim. The checked-in PDFs are the rewritten versions. A fresh Turnitin run is
+still required; the detector is proprietary and no score can be guaranteed.
 
 ## What changed from the initial draft
 
@@ -99,10 +108,11 @@ is the archival full paper, not the four-page Doctoral Consortium abstract.
    `TorShield_RAIT2027_DC.pdf` plus the one-page resume and one-page supervisor
    recommendation, merged into a single PDF. The full `TorShield_IEEE.pdf` is
    not the Doctoral Consortium submission.
-2. Confirm the author list and email addresses: Roshan Srikanth and
-   Dr. S. UdhayaKumar. The address `roshansrikanth21@gmail.com` matches the
-   repository Git configuration. The Doctoral Consortium is single-blind, so
-   include both names, the affiliation, and both emails on page 1.
+2. Confirm the author list and email addresses: Roshan Srikanth
+   (`roshansrikanth21@gmail.com`), Yash Yashuday (`yyashuday@gmail.com`), and
+   Dr. S. UdhayaKumar (`sudhayakumar@ch.amrita.edu`). The Doctoral Consortium
+   is single-blind, so include all three names, the affiliation, and all three
+   emails on page 1.
 3. Confirm Ph.D. registration and that the applicant is within the first three
    years of the doctoral program; this is an eligibility condition, not a
    formatting detail.
