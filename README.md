@@ -62,7 +62,7 @@ implementation and a measurement vehicle.
 ```
 outer IP | UDP:4789 | 16-byte header | padded ciphertext | 16-byte tag
 
-header : 'T' 'S' | version 1 | flags (bit 0 = inner packet is IPv6) | 4 reserved | 64-bit BE seq
+header : 'T' 'S' | version 1 | flags (bit 0 = inner packet is IPv6) | 32-bit key id | 64-bit BE seq
 nonce  : 4-byte XOR fold of (src, dst) || 8-byte BE seq
 AAD    : the 16-byte header
 cipher : ChaCha20-Poly1305, plaintext zero-padded to a 64-byte bucket

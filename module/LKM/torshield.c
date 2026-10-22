@@ -762,7 +762,7 @@ crypted:
  *    [ 16-byte header ][ ciphertext: padded inner IP packet ][ 16-byte tag ]
  *
  *  header (also the AEAD associated data):
- *    'T' 'S', version 1, flags (bit0 = inner is IPv6), 4 reserved,
+ *    'T' 'S', version 1, flags (bit0 = inner is IPv6), 32-bit key id,
  *    8-byte per-peer sequence number (big endian).
  *
  *  AEAD is ChaCha20-Poly1305 (RFC 7539), built from the in-kernel ChaCha20
@@ -771,7 +771,7 @@ crypted:
  *
  *  nonce = 4-byte fold of (src,dst) || 8-byte sequence
  *
- *  Sequence numbers are per peer and the receiver keeps a 64-packet sliding
+ *  Sequence numbers are per peer and the receiver keeps a 1024-packet sliding
  *  window, so replays are dropped.  Padding rounds every inner packet up to
  *  64 bytes so exact sizes are not visible.
  */
@@ -798,7 +798,7 @@ struct ts_tun_hdr {
 	u8  magic[2];
 	u8  version;
 	u8  flags;
-	u32 reserved;
+	u32 key_id;                     /* 0 = legacy global PSK */
 	u64 seq;                        /* big endian on the wire */
 } __packed;
 

@@ -19,6 +19,16 @@ xorctl
 # test captures (binary evidence, reproduced by the stage scripts)
 *.pcap
 
+# LaTeX build artifacts (the PDF is checked in)
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+
 # editor / os noise
 *.swp
 *~
