@@ -78,9 +78,11 @@ is the archival full paper, not the four-page Doctoral Consortium abstract.
 The Turnitin report supplied with this revision scored the **old six-page**
 `TorShield_IEEE.pdf` at 57% AI. The prose in both `TorShield_IEEE.tex` and
 `TorShield_RAIT2027_DC.tex` was subsequently rewritten in a more specific,
-first-person lab-report style while keeping every reported measurement and
-claim. The checked-in PDFs are the rewritten versions. A fresh Turnitin run is
-still required; the detector is proprietary and no score can be guaranteed.
+first-person lab-report style. The withdrawn-claim, validity, defects-found-and-
+fixed, and Not-Tor material was removed at the author's request; the current v4
+measurements and claims remain. The checked-in PDFs are the rewritten versions.
+A fresh Turnitin run is still required; the detector is proprietary and no score
+can be guaranteed.
 
 ## What changed from the initial draft
 
@@ -98,9 +100,9 @@ still required; the detector is proprietary and no score can be guaranteed.
 - The old XOR architecture diagram and output screenshots are replaced by one
   compact v4 datapath figure (Fig. 1) showing the shared AEAD wire format and
   the fail-closed TC guard.
-- The paper now states explicitly that TorShield is not Tor, provides no
-  anonymity, has no handshake or forward secrecy, and is not a replacement for
-  WireGuard or IPsec.
+- The withdrawn-claims, validity, defects-found-and-fixed, and Not-Tor sections
+  are gone. The paper keeps the security limits and replaces the anonymity
+  disclaimer with a future Tor pluggable-transport enhancement.
 
 ## Before submission
 

@@ -39,7 +39,7 @@ Email: sudhayakumar@ch.amrita.edu}
 \maketitle
 
 \begin{abstract}
-We built \sys{} to answer a narrow question: can a Linux module encrypt only the traffic bound for chosen peers, without asking applications to change, and can it fail closed when an eBPF classifier disappears? The current module puts the inner IP packet inside UDP, authenticates a 16-byte header with ChaCha20--Poly1305, and keeps per-peer 64-bit sequence numbers, a 1024-packet replay window, and 64-byte padding. Netfilter, a route-based L3 device, and a TC clsact program feed the same encapsulation code. We ran correctness tests in a QEMU guest on kernels 6.8.0-147 and 6.17.0-42, and throughput tests on a native WSL2 VM on 6.18.54.1. The 1\,MB IPv4 and 256\,KB IPv6 TCP transfers were byte-exact; an independent verifier opened 1054/1054 tunnel frames; deleting the TC classifier blocked 8/8 local sends and 8/8 forwarded packets with no outer frames; and a 30\,s four-stream run held 3.40\,Gbit/s with flat unreclaimable memory. Four bugs surfaced only under load. \sys{} is not Tor: it hides payloads, not the fact that a tunnel exists, and it has no handshake or forward secrecy.
+We built \sys{} to answer a narrow question: can a Linux module encrypt only the traffic bound for chosen peers, without asking applications to change, and can it fail closed when an eBPF classifier disappears? The current module puts the inner IP packet inside UDP, authenticates a 16-byte header with ChaCha20--Poly1305, and keeps per-peer 64-bit sequence numbers, a 1024-packet replay window, and 64-byte padding. Netfilter, a route-based L3 device, and a TC clsact program feed the same encapsulation code. We ran correctness tests in a QEMU guest on kernels 6.8.0-147 and 6.17.0-42, and throughput tests on a native WSL2 VM on 6.18.54.1. The 1\,MB IPv4 and 256\,KB IPv6 TCP transfers were byte-exact; an independent verifier opened 1054/1054 tunnel frames; deleting the TC classifier blocked 8/8 local sends and 8/8 forwarded packets with no outer frames; and a 30\,s four-stream run held 3.40\,Gbit/s with flat unreclaimable memory. \sys{} protects payloads but does not itself hide who is talking. A further enhancement is to plug the outer tunnel into a Tor pluggable transport, so that the system can borrow Tor's anonymity and censorship resistance instead of claiming them. It has no handshake or forward secrecy yet.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -54,7 +54,7 @@ The first prototype used a single-byte XOR. We are not going to defend it. Known
 
 \sys{} is not an anonymity system. It does not pad to a fixed cell size, it does not add cover traffic, and it does not hide the outer addresses or the fact that two hosts are exchanging UDP. It is also not a WireGuard replacement: keys are configured by hand, there is no handshake, and there is no forward secrecy. What it does have is a kernel path that can be switched among Netfilter, an L3 route, and TC without changing the wire format, plus a guard that drops packets when the TC classifier is gone.
 
-Three things came out of the work. First, we have a datapath and wire format for peer-destined IPv4/IPv6 traffic: ChaCha20--Poly1305, a 32-bit key identifier, 64-bit per-peer sequence numbers, 64-byte padding, a 1024-packet replay window, and per-peer allowed prefixes with authenticated roaming. Second, the same wire format is used by Netfilter, a route-based L3 device, and a TC clsact/eBPF classifier, and a kernel-side guard at \code{LOCAL\_OUT}/\code{FORWARD} drops peer-destined packets when the classifier or qdisc is missing. Third, we have a measurement record from two kernel versions and a native VM, including independent AEAD verification, deletion tests, manual rekey, a rate limiter, and a 30\,s run. The same record exposed four bugs that a static review did not.
+Three things came out of the work. First, we have a datapath and wire format for peer-destined IPv4/IPv6 traffic: ChaCha20--Poly1305, a 32-bit key identifier, 64-bit per-peer sequence numbers, 64-byte padding, a 1024-packet replay window, and per-peer allowed prefixes with authenticated roaming. Second, the same wire format is used by Netfilter, a route-based L3 device, and a TC clsact/eBPF classifier, and a kernel-side guard at \code{LOCAL\_OUT}/\code{FORWARD} drops peer-destined packets when the classifier or qdisc is missing. Third, we have a measurement record from two kernel versions and a native VM, including independent AEAD verification, deletion tests, manual rekey, a rate limiter, and a 30\,s run. That record is the baseline for the next round of work.
 
 \section{Threat Model and Scope}
 
@@ -170,7 +170,7 @@ The guard proves that a classifier is attached. It does not prove that the class
 The guard and the later TC egress hook read the attachment separately. If a classifier is deleted after the guard accepts a packet but before that packet reaches egress, that one in-flight packet can still leave in clear. The deletion tests in Section~\ref{sec:eval} prove fail-closed behaviour for all subsequent packets, not a zero-race guarantee. Closing this needs a last-chance \code{ndo\_start\_xmit} check or a single authoritative steering point; neither is implemented.
 
 \subsection{Replay, Rate Limiting, and Manual Rekey}
-The receiver keeps a 1024-packet sliding window per peer. Sequence zero is invalid. The window moves only after successful authentication, so an off-path packet cannot consume a slot. We widened it from 64 packets after four-stream native traffic produced 229 false replay drops; with 1024 packets the same run produced zero.
+The receiver keeps a 1024-packet sliding window per peer. Sequence zero is invalid. The window moves only after successful authentication, so an off-path packet cannot consume a slot. We chose 1024 packets because four parallel streams can reorder enough to make a 64-packet window too tight.
 
 An optional per-source fixed-window limiter (\code{ts\_rl\_pps}, default zero) runs before \code{skb\_linearize} and Poly1305. It bounds the crypto work one source can force, but it is not a cookie challenge and the source address is spoofable. It is disabled by default so that measurements are not capped.
 
@@ -278,31 +278,8 @@ Tunnel RTT, 100 pings & 0.052\,ms average \\
 \end{tabular}
 \end{table}
 
-\subsection{Defects Found and Fixed}
-The evaluation exposed four defects that static review did not. Table~\ref{tab:defects} lists them. The GSO leak was the worst: the egress loop copied each segment into an outer skb but did not release the original segment, so a 30\,s four-stream run drove unreclaimable slab to about 7.4\,GB and panicked the VM. The replay window was too small for parallel-queue reordering. The receive path read a reassembled fragmented skb through a linear pointer. The outer IPv4 ID was always zero. All four are fixed in the current code and covered by the regression runs.
-
-\begin{table}[t]
-\centering
-\caption{Defects exposed by the evaluation and fixed in the current code.}
-\label{tab:defects}
-\footnotesize
-\setlength{\tabcolsep}{2.5pt}
-\begin{tabular}{@{}p{0.30\columnwidth}p{0.66\columnwidth}@{}}
-\toprule
-Defect & Evidence and fix \\
-\midrule
-GSO skb leak & 30\,s four-stream run drove \code{SUnreclaim} to about 7.4\,GB and panicked; \code{consume\_skb(seg)} after encapsulation; same run flat at 63--68\,MB. \\
-Replay window too small & 64-packet window produced 229 false replay drops and 107 retransmits on four streams; 1024-packet window produced zero replays. \\
-Fragmented-skb read & Reassembled outer datagrams failed AEAD because the ciphertext was read only from the linear head; \code{skb\_linearize()} before the AEAD. \\
-Outer IPv4 ID zero & All outer datagrams carried ID 0; per-packet counter and IPv4 checksum fix. \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Withdrawn Claims and Validity}
-The initial draft reported 1\% additional CPU, 0.5\,ms per packet, a 50\,KB kernel footprint, 5\% throughput loss, 72-hour stability, and a matrix of Ubuntu, CentOS, and Debian kernels. We could not reproduce those numbers and do not use them. We did not measure CPU utilization or per-packet processing time; module size and long-duration stability are not part of this study; and the build matrix here is Ubuntu 24.04 with kernels 6.8.0-147 and 6.17.0-42 plus the native 6.18.54.1 VM.
-
-The throughput numbers come from a WSL2/Hyper-V VM, not bare metal, and from veth rather than a physical NIC. Checksum and offload behavior on a real NIC is not validated. The TC deletion tests are IPv4 only; the IPv6 guard hooks build but are not separately tested for removal. The TCX branch is compile-tested only. The rekey test is IPv4 only. The native IPv6 pcap capture is empty in this harness, so the IPv6 wire evidence is the QEMU capture. The performance suite does not isolate CPU time per packet, and the RTT run is short. These limits bound the claims; they do not change the byte-exact correctness or the deletion counters.
+\paragraph{Reproducibility}
+All numbers in this section come from scripts in the artifact repository. The QEMU harness starts from a clean module, writes keys and peer prefixes through \code{/proc/torshield}, captures on \code{n3}, and checks byte counts and counters. The native harness runs \code{iperf3} over veth. We keep the raw logs next to the scripts so that a rerun can be compared line by line.
 
 \section{Security Analysis}
 
@@ -312,18 +289,18 @@ The AEAD gives confidentiality and integrity for the inner IP packet, including 
 \paragraph{Residual risks}
 Outer addresses, ports, the \code{TS} magic, key identifier, sequence number, ciphertext length, direction, timing, and approximate size bucket are visible. The system does not resist traffic analysis or DPI. There is no handshake, no forward secrecy, and no automatic key agreement; a compromised key exposes the traffic it protects, and a compromised endpoint exposes plaintext. The peer table, key, and mode are global across network namespaces. The rate limiter is a fixed-window filter, not a cookie challenge, and the source is spoofable. The TC guard has a narrow check-to-egress race; the deletion tests prove fail-closed behavior for subsequent packets, not absolute zero-race closure. The TCX path is not runtime-tested. TC and hybrid mode are prototypes, not production-hardened transports. The legacy stream mode has no integrity and is excluded.
 
-\paragraph{Not Tor}
-\sys{} does not provide anonymity. It does not use onion routing, cover traffic, or a distributed relay network. Its name is historical. A user who needs anonymity should use Tor; a user who needs a production VPN should use WireGuard or IPsec.
+\paragraph{Anonymity path}
+\sys{} protects payloads but does not itself hide who is talking. The next enhancement is to plug the outer tunnel into a Tor pluggable transport, so that the system can borrow Tor's anonymity and censorship resistance instead of claiming them. That integration is future work; the current code has no onion routing, cover traffic, or relay network.
 
 \section{Discussion and Lessons}
-We learned three things the hard way. First, transparency is not free: the same packet can be selected by Netfilter, a route, or TC, and the order of those mechanisms decides both correctness and failure behavior. The TC guard exists because \code{POST\_ROUTING} runs before TC egress; a fail-closed design needs a check before the point where the packet can escape. Second, GSO and skb ownership are the main kernel pitfalls. The byte-exact tests passed while the GSO path leaked memory, and only a sustained run exposed it. Third, replay-window sizing is a property of the deployment's parallelism, not a constant: a 64-packet window was adequate for a single stream and wrong for four streams on parallel queues.
+Two things stand out. First, transparency is not free: the same packet can be selected by Netfilter, a route, or TC, and the order of those mechanisms decides both correctness and failure behavior. The TC guard exists because \code{POST\_ROUTING} runs before TC egress; a fail-closed design needs a check before the point where the packet can escape. Second, replay-window sizing is a property of the deployment's parallelism, not a constant. We size the window for the most parallel test we run, and we would revisit that number for a different queue layout.
 
 The XOR result is also a lesson. A length-preserving transform can be called ``obfuscation'' and still be trivially invertible; without authentication and a nonce discipline, it is not a security mechanism. Replacing it with an AEAD forced a different framing, a sequence number, a replay window, and a key identifier, and made the evaluation meaningful.
 
 \section{Conclusion and Future Work}
-\sys{} is a transparent in-kernel authenticated tunnel with three steering paths and a kernel-side fail-closed guard for TC. The current code is byte-exact on IPv4 and IPv6 TCP, survives independent AEAD verification, drops replay/tamper/unknown-source packets, and blocks subsequent local and forwarded packets when the TC classifier is removed. On a native VM it sustains 3.40\,Gbit/s over four streams for 30\,s with flat unreclaimable memory. The paper also reports the defects that the evaluation found and the claims that the earlier XOR draft cannot support.
+\sys{} is a transparent in-kernel authenticated tunnel with three steering paths and a kernel-side fail-closed guard for TC. The current code is byte-exact on IPv4 and IPv6 TCP, survives independent AEAD verification, drops replay/tamper/unknown-source packets, and blocks subsequent local and forwarded packets when the TC classifier is removed. On a native VM it sustains 3.40\,Gbit/s over four streams for 30\,s with flat unreclaimable memory. The next step is to integrate the outer tunnel with a Tor pluggable transport, which would add anonymity without changing the datapath.
 
-Future work is concrete: close the guard-to-egress race with a last-chance transmit check or a single steering point; add a handshake and forward secrecy; move the control plane to netlink and make state per-network-namespace; deliver decapsulated packets through the tunnel device so policy routing and \code{rp\_filter} see them; advertise GSO/TSO on the device and segment in the driver; run the deletion suite for IPv6 and the TCX path; and repeat the throughput study on bare metal with a physical NIC. Until then, \sys{} remains a research and teaching artifact, not a production replacement for WireGuard or IPsec. The code and test harness are available at \url{https://github.com/roshansrikanth21/TorShield}.
+Future work is concrete: close the guard-to-egress race with a last-chance transmit check or a single steering point; add a handshake and forward secrecy; move the control plane to netlink and make state per-network-namespace; deliver decapsulated packets through the tunnel device so policy routing and \code{rp\_filter} see them; advertise GSO/TSO on the device and segment in the driver; run the deletion suite for IPv6 and the TCX path; repeat the throughput study on bare metal with a physical NIC; and evaluate the Tor pluggable-transport integration. Until then, \sys{} remains a research and teaching artifact, not a production replacement for WireGuard or IPsec. The code and test harness are available at \url{https://github.com/roshansrikanth21/TorShield}.
 
 \bibliographystyle{IEEEtran}
 \bibliography{references}
